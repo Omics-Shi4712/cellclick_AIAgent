@@ -7,6 +7,7 @@ from .v1 import V1_PROTOCOL
 from .v2 import V2_PROTOCOL
 from .v3 import V3_PROTOCOL
 from .v4 import V4_PROTOCOL
+from .v4_5 import V45_PROTOCOL
 
 
 _PROTOCOLS: dict[str, ProtocolSpec] = {
@@ -14,6 +15,7 @@ _PROTOCOLS: dict[str, ProtocolSpec] = {
     V2_PROTOCOL.version: V2_PROTOCOL,
     V3_PROTOCOL.version: V3_PROTOCOL,
     V4_PROTOCOL.version: V4_PROTOCOL,
+    V45_PROTOCOL.version: V45_PROTOCOL,
 }
 
 

@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from ..v3.rag import DEFAULT_TOP_K, MarkerReferenceRetriever, default_reference_path, load_retriever
+from ..reference import DEFAULT_TOP_K, MarkerReferenceRetriever, default_reference_path, load_retriever
 from .models import ReferenceCandidate, ReferenceGeneEvidence, ReferenceMatchPacket
 
 RETRIEVAL_VERSION = "v4-global-mgc-cosg-ai-v1"

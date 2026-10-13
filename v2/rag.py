@@ -68,7 +68,7 @@ class _ReferenceDocument:
 
 
 def default_reference_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "ref" / "marker" / "human_cell_marker_filtered_v1_main.tsv"
+    return Path(__file__).resolve().parents[1] / "ref" / "CellIdentification" / "human_cell_marker_filtered_v1_main.tsv"
 
 
 def reference_sha256(path: Path) -> str:
