@@ -172,8 +172,8 @@ async def _run(*, task: TaskInput, client: JsonChatClient, model: str, temperatu
         if result.task_id != task.task_id:
             raise ValueError(f"diagnosis task_id mismatch: expected {task.task_id!r}, got {result.task_id!r}")
         for assessment in result.candidate_assessments:
-            hypothesis_id = assessment.get("hypothesis_id") if isinstance(assessment, dict) else None
-            if hypothesis_id is not None and hypothesis_id not in hypothesis_ids:
+            hypothesis_id = assessment.hypothesis_id
+            if hypothesis_id not in hypothesis_ids:
                 raise ValueError("diagnosis assessment cites an unknown hypothesis")
         return result
 
@@ -262,8 +262,8 @@ async def _run(*, task: TaskInput, client: JsonChatClient, model: str, temperatu
             if result.task_id != task.task_id:
                 raise ValueError(f"evidence_review task_id mismatch: expected {task.task_id!r}, got {result.task_id!r}")
             for assessment in result.candidate_assessments:
-                hypothesis_id = assessment.get("hypothesis_id") if isinstance(assessment, dict) else None
-                if hypothesis_id is not None and hypothesis_id not in hypothesis_ids:
+                hypothesis_id = assessment.hypothesis_id
+                if hypothesis_id not in hypothesis_ids:
                     raise ValueError("evidence_review assessment cites an unknown hypothesis")
             return result
 
@@ -284,9 +284,13 @@ async def _run(*, task: TaskInput, client: JsonChatClient, model: str, temperatu
         else:
             no_progress_rounds = 0
         successful_observations = sum(1 for item in observations if item.status == "success")
+        usable_assessments = [item for item in review.candidate_assessments
+                              if item.status in {"supported", "uncertain", "conflicted"}
+                              and (item.supporting_evidence or item.conflicting_evidence)]
+        blocking_questions = bool(review.unresolved_questions) and review.next_action != "finish"
         finish_allowed = bool(
             review.next_action == "finish" and successful_observations > 0
-            and review.candidate_assessments
+            and usable_assessments and not blocking_questions
         )
         boost_history.append({"cycle": cycle, "stage": "evidence_review", "next_action": review.next_action,
                               "candidate_assessments": [item.model_dump() for item in review.candidate_assessments],
@@ -485,4 +489,3 @@ def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str
             await close_json_client(client)
 
     return asyncio.run(run())
-

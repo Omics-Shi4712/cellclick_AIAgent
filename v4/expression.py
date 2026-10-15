@@ -170,7 +170,10 @@ def collect_initial_evidence(task: TaskInput, *, expression_file: str | Path, ma
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"Invalid CellClick V4 expression manifest: {manifest_path}") from error
-    if manifest.get("schema_version") != "cellclick.v4.expression.2":
+    if manifest.get("schema_version") not in {
+        "cellclick.expression.2",
+        "cellclick.v4.expression.2",
+    }:
         raise ValueError("Unsupported CellClick V4 expression manifest schema")
     if Path(str(manifest.get("h5ad_path", ""))).resolve() != expression_path:
         raise ValueError("Expression manifest h5ad_path does not match task expression_file")
