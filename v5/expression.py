@@ -105,6 +105,27 @@ def cluster_expression_evidence(*, expression_file: str | Path, manifest_file: s
         del adata
 
 
+def marker_expression_evidence(*, expression_file: str | Path, manifest_file: str | Path,
+                               source_row_id: str, genes: Iterable[str]) -> dict[str, Any]:
+    """Return expression statistics for exactly the submitted genes, in order."""
+    requested = list(dict.fromkeys(str(gene).strip() for gene in genes if str(gene).strip()))
+    if not requested:
+        raise ValueError("genes must contain at least one non-empty marker")
+    result = gene_statistics(expression_file=expression_file, manifest_file=manifest_file,
+                             source_row_id=source_row_id, genes=requested)
+    rows = []
+    for row in result["genes"]:
+        if not row.get("available"):
+            rows.append({"gene": row["gene"], "status": "unavailable", **row})
+            continue
+        status = "available_positive" if (row.get("pct_expressing", 0) > 0 or
+                                           row.get("background_pct_expressing", 0) > 0 or
+                                           row.get("mean_log1p", 0) != 0 or
+                                           row.get("background_mean_log1p", 0) != 0) else "available_zero"
+        rows.append({"gene": row["gene"], "status": status, **row})
+    return {**result, "genes": rows}
+
+
 def gene_statistics(*, expression_file: str | Path, manifest_file: str | Path,
                     source_row_id: str, genes: Iterable[str]) -> dict[str, Any]:
     """Return bounded target/background statistics for requested genes only."""

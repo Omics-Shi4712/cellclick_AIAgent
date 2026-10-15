@@ -9,7 +9,7 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 from cellclick.llm import JsonChatClient, close_json_client
 from cellclick.retry import retry_json
-from .expression import cluster_expression_evidence
+from .expression import marker_expression_evidence
 from .ledger import make_target, snapshot_id
 from .models import (AdjudicationResponse, ArgumentDraftResponse, CandidateDraft, CandidateDraftResponse, CandidateProposal,
     CandidateRegistry, EvidenceLedgerEntry, FinalAnnotation, MarkerAudit, MessageEnvelope,
@@ -21,7 +21,7 @@ from .verifier import dispatch_requests, report
 
 PROTOCOL_VERSION = "v5"
 ANNOTATION_CANDIDATES, MAX_ROUNDS, REQUEST_RETRIES, MAX_PARALLEL_CLUSTERS = 5, 4, 2, 1
-WORKFLOW_VERSION = "v5.3-reference-evidence-auto-recheck-audited-fallback"
+WORKFLOW_VERSION = "v5.4-marker-aligned-audit-reference-evidence-auto-recheck-audited-fallback"
 
 # Labels that describe an expression program or technical state rather than
 # an identifiable cell type.  They are filtered before entering the registry
@@ -41,9 +41,29 @@ def _is_biological_cell_type(label: str) -> bool:
 def _initial_evidence(task: TaskInput, expression: dict[str, Any]) -> list[EvidenceLedgerEntry]:
     result = [EvidenceLedgerEntry(evidence_id=f"E_MARKER_{i:03d}", task_id=task.task_id, target_id=task.cluster_id,
         kind="gene", source="submitted_marker", payload={"gene": gene}) for i, gene in enumerate(task.ordered_markers, 1)]
-    result.extend(EvidenceLedgerEntry(evidence_id=f"E_EXPR_{i:03d}", task_id=task.task_id, target_id=task.cluster_id,
-        kind="derived", source="expression_summary", payload=row) for i, row in enumerate(expression.get("top_differential_genes", []), 1))
+    rows = expression.get("genes", [])
+    by_gene = {str(row.get("gene")): row for row in rows if isinstance(row, dict)}
+    for i, gene in enumerate(task.ordered_markers, 1):
+        row = by_gene.get(gene, {"gene": gene, "status": "unavailable", "available": False})
+        result.append(EvidenceLedgerEntry(evidence_id=f"E_EXPR_{i:03d}", task_id=task.task_id,
+            target_id=task.cluster_id, kind="derived", source="marker_expression_statistics", payload=row))
     return result
+
+
+def _validate_marker_audit(audit: MarkerAudit, task: TaskInput, evidence: list[EvidenceLedgerEntry]) -> None:
+    expected = [" ".join(g.strip().casefold().split()) for g in task.ordered_markers]
+    seen = [" ".join(item.gene.strip().casefold().split()) for item in audit.marker_assessments]
+    # Legacy V5 responses may omit this field; preserve replay compatibility.
+    if not seen:
+        return
+    if set(seen) != set(expected) or len(seen) != len(set(seen)):
+        raise ValueError("marker_audit.marker_assessments must cover each input marker exactly once")
+    valid = {item.evidence_id for item in evidence}
+    if not set(audit.evidence_ids) <= valid:
+        raise ValueError("marker_audit references unknown evidence ID")
+    for item in audit.marker_assessments:
+        if not set(item.evidence_ids) <= valid:
+            raise ValueError("marker_audit references unknown evidence ID")
 
 
 def _reference_evidence(task: TaskInput, packet: dict[str, Any]) -> EvidenceLedgerEntry | None:
@@ -309,7 +329,7 @@ async def _verify(state: V5State, *, scope: str, client: JsonChatClient, model: 
 
 
 async def _workflow(state: V5State, *, client: JsonChatClient, model: str, temperature: float, retries: int, context: dict[str, Any]) -> V5State:
-    audit = await _complete(client, state, system=MARKER_AUDIT_SYSTEM, recipient="MarkerAudit", stage="marker_audit", model=model, temperature=temperature, retries=retries, response_type=MarkerAudit, payload={"task": state.task.model_dump(), "evidence_ledger": [v.model_dump() for v in state.evidence_store]})
+    audit = await _complete(client, state, system=MARKER_AUDIT_SYSTEM, recipient="MarkerAudit", stage="marker_audit", model=model, temperature=temperature, retries=retries, response_type=MarkerAudit, payload={"task": state.task.model_dump(), "evidence_ledger": [v.model_dump() for v in state.evidence_store]}, semantic_validator=lambda value: _validate_marker_audit(value, state.task, state.evidence_store))
     state.marker_audit = audit
     trusted_labels = context.get("trusted_major_labels", [])
     major = await _complete(client, state, system=MAJOR_TYPE_SYSTEM, recipient="MajorType", stage="major_candidates", model=model, temperature=temperature, retries=retries, response_type=CandidateDraftResponse, payload={"task": state.task.model_dump(), "marker_audit": audit.model_dump(), "trusted_reference_candidates": trusted_labels, "evidence_ledger": [v.model_dump() for v in state.evidence_store]})
@@ -406,7 +426,7 @@ def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str
     if expression_file is None or expression_manifest is None: raise ValueError("CellClick V5 requires expression evidence")
     if not marker_path: raise ValueError("CellClick V5 requires cellmarker_reference_path")
     task = TaskInput(task_id=cluster_id, cluster_id=cluster_id, dataset=dataset, species=species, tissue=tissue, ordered_markers=markers)
-    expression = cluster_expression_evidence(expression_file=expression_file, manifest_file=expression_manifest, source_row_id=cluster_id)
+    expression = marker_expression_evidence(expression_file=expression_file, manifest_file=expression_manifest, source_row_id=cluster_id, genes=markers)
     state = V5State(task=task, evidence_store=_initial_evidence(task, expression), budget={"tool_requests": 8, "revisions": 2})
     trusted_labels: list[str] = []
     reference_packet: dict[str, Any] = {}

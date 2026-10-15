@@ -23,9 +23,18 @@ class TaskInput(BaseModel):
         return self
 
 
+class MarkerAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gene: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+    suggested_use: Literal["primary", "supporting", "review"]
+    reason: str = Field(min_length=1)
+
+
 class MarkerAudit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     audit_id: str = Field(min_length=1)
+    marker_assessments: list[MarkerAssessment] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     quality_flags: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
