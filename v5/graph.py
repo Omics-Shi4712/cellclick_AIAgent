@@ -1,4 +1,4 @@
-"""Program-controlled V5.8 execution graph."""
+"""Program-controlled V5.9 execution graph."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,7 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 from cellclick.llm import JsonChatClient, close_json_client
 from cellclick.retry import retry_json
+from .context import build_llm_context
 from .expression import marker_expression_evidence
 from .ledger import snapshot_id
 from .models import (AdjudicationResponse, CandidateDraft, CandidateProposal, MajorCandidateResponse,
@@ -23,8 +24,8 @@ from .verifier import verify
 from .candidate_registry import register_major, register_subtype
 
 PROTOCOL_VERSION = "v5"
-ANNOTATION_CANDIDATES, MAX_ROUNDS, REQUEST_RETRIES, MAX_PARALLEL_CLUSTERS = 5, 6, 2, 1
-WORKFLOW_VERSION = "v5.8-unified-verifier-state-machine"
+ANNOTATION_CANDIDATES, MAX_ROUNDS, REQUEST_RETRIES, MAX_PARALLEL_CLUSTERS = 5, 6, 2, 2
+WORKFLOW_VERSION = "v5.9-deduplicated-llm-context-cosine-summary"
 
 
 @lru_cache(maxsize=16)
@@ -38,6 +39,10 @@ def _cached_file_sha256(path: str, size: int, mtime_ns: int) -> str:
 
 def _file_sha256(path: str) -> str:
     resolved = Path(path).resolve()
+    from .runtime import CURRENT
+    runtime = CURRENT.get()
+    if runtime and str(resolved) in runtime.resources.hashes:
+        return runtime.resources.hashes[str(resolved)]
     info = resolved.stat()
     return _cached_file_sha256(str(resolved), info.st_size, info.st_mtime_ns)
 
@@ -192,7 +197,7 @@ async def _complete(client: JsonChatClient, state: V5State, *, system: str, reci
     value, _ = await retry_json(
         client, system=system, user=envelope.model_dump_json(), schema=response_type.model_json_schema(),
         model=model, temperature=temperature, retries=retries, validator=validate,
-        strict=True, stage=stage)
+        strict=True, stage=stage, v5_policy=True)
     state.transition_history.append({"stage": stage, "message_id": envelope.message_id,
                                      "evidence_snapshot_id": envelope.evidence_snapshot_id})
     return response_type.model_validate(value)
@@ -273,9 +278,8 @@ async def _workflow(state: V5State, *, client: JsonChatClient, model: str, tempe
                 client, state, system=SUBTYPE_SYSTEM, recipient="SubType", stage="subtype_candidates",
                 model=model, temperature=temperature, retries=retries,
                 response_type=SubtypeCandidateResponse,
-                payload={"task": state.task.model_dump(), "parent_candidate": parent.model_dump(),
-                         "marker_audit": audit.model_dump(), "subtype_catalog": subtype_catalog,
-                         "evidence_ledger": [v.model_dump() for v in state.evidence_store]},
+                payload={**build_llm_context(state), "parent_candidate": parent.model_dump(),
+                         "subtype_catalog": subtype_catalog},
                 semantic_validator=validate_subtype,
             )
             state.candidate_registry = _register(
@@ -330,12 +334,9 @@ async def _workflow(state: V5State, *, client: JsonChatClient, model: str, tempe
     decision = await _complete(
         client, state, system=ADJUDICATOR_SYSTEM, recipient="Adjudicator", stage="adjudication",
         model=model, temperature=temperature, retries=retries, response_type=AdjudicationResponse,
-        payload={"task": state.task.model_dump(), "candidate_registry": state.candidate_registry.model_dump(),
-                 "authoritative_report_id": authoritative_report.report_id,
+        payload={**build_llm_context(state), "authoritative_report_id": authoritative_report.report_id,
                  "arguments": [item.model_dump() for item in state.arguments],
-                 "verification_reports": [item.model_dump() for item in state.verification_reports],
-                 "verification_history": list(state.verification_history),
-                 "evidence_ledger": [item.model_dump() for item in state.evidence_store]},
+                 },
         semantic_validator=validate_adjudication)
     state.final_result = FinalAnnotation(
         execution_status="success", accepted_level=chosen.granularity,
@@ -387,7 +388,7 @@ def build_graph(*, client: JsonChatClient, model: str, temperature: float, retri
     return graph.compile()
 
 
-def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str,
+def _annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str,
                      markers: list[str], client: JsonChatClient, model: str, temperature: float,
                      retries: int, work_dir: Path | None = None, prompt_version: str = PROMPT_VERSION,
                      protocol_version: str = PROTOCOL_VERSION, expression_file: str | Path | None = None,
@@ -415,7 +416,10 @@ def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str
     reference_packet: dict[str, Any] = {}
     try:
         from cellclick.reference import MarkerReferenceRetriever
-        reference_packet = MarkerReferenceRetriever.from_tsv(Path(marker_path)).retrieve(
+        from .runtime import CURRENT
+        runtime = CURRENT.get()
+        retriever = runtime.resources.retriever(marker_path) if runtime else MarkerReferenceRetriever.from_tsv(Path(marker_path))
+        reference_packet = retriever.retrieve(
             markers, tissue, top_k=top_k).prompt_dict()
     except Exception as error:
         state.verification_history.append({"role": "program", "stage": "initial_cellmarker",
@@ -426,12 +430,13 @@ def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str
     comparison = binding.get("ref_path") if isinstance(binding, dict) else None
     if comparison:
         try:
-            manifest = json.loads(Path(expression_manifest).read_text(encoding="utf-8"))
+            from .runtime import read_json
+            manifest = read_json(expression_manifest)
             configured_h5ad = Path(str(binding.get("h5ad_path", ""))).resolve()
             source_h5ad = Path(str(manifest.get("source_h5ad_path", ""))).resolve()
             if not configured_h5ad.is_file() or configured_h5ad != source_h5ad:
                 raise LookupError("comparison_reference_source_h5ad_mismatch")
-            loaded = json.loads(Path(comparison).read_text(encoding="utf-8"))
+            loaded = read_json(comparison)
             if not isinstance(loaded, dict) or not all(
                     isinstance(label, str) and isinstance(genes, list)
                     and all(isinstance(gene, str) for gene in genes) for label, genes in loaded.items()):
@@ -471,3 +476,11 @@ def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str
     return {"status": final.get("verification_status", "failed"),
             "round_count": sum(completed.rounds.values()), "rounds": completed.rounds,
             "final_record": final, "trace": trace}
+
+
+def annotate_cluster(*, runtime=None, **kwargs):
+    """Bind non-serializable resources outside graph state and model context."""
+    if runtime is None:
+        return _annotate_cluster(**kwargs)
+    with runtime.activate():
+        return _annotate_cluster(**kwargs)

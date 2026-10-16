@@ -37,6 +37,15 @@ class ToolRegistry:
         return tuple(sorted(self._handlers))
 
     def dispatch(self, request: ToolRequest, context: dict[str, Any]) -> ToolObservation:
+        import time
+        from .runtime import emit
+        started = time.perf_counter()
+        try:
+            return self._dispatch(request, context)
+        finally:
+            emit("tool", tool_name=request.tool_name, duration_seconds=time.perf_counter() - started)
+
+    def _dispatch(self, request: ToolRequest, context: dict[str, Any]) -> ToolObservation:
         digest = parameter_hash(request, context)
         handler = self._handlers.get(request.tool_name)
         if handler is None:
@@ -89,14 +98,48 @@ def build_tool_registry(context: dict[str, Any]) -> ToolRegistry:
         compare_pairs = request.arguments.get("compare_pairs")
         if not isinstance(gene_sets, list) or not isinstance(compare_pairs, list):
             raise ValueError("gene_cosine requires gene_sets and compare_pairs lists")
-        return gene_cosine_statistics(
+        result = gene_cosine_statistics(
             expression_file=context["expression_file"], manifest_file=context["expression_manifest"],
             source_row_id=context["source_row_id"], gene_sets=gene_sets, compare_pairs=compare_pairs,
         )
+        digest = parameter_hash(request, context)
+        artifact_id = "GC_" + digest[:20]
+        document = {
+            "schema_version": "cellclick.v5.gene_cosine.1",
+            "artifact_id": artifact_id,
+            "parameter_hash": digest,
+            "task_id": request.task_id,
+            "target_id": request.target_id,
+            "source_row_id": context["source_row_id"],
+            "binding": {key: context.get(key) for key in (
+                "expression_file", "expression_manifest", "expression_file_sha256",
+                "expression_manifest_sha256",
+            )},
+            "arguments": request.arguments,
+            "result": result,
+        }
+        serialized = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        artifact_sha256 = hashlib.sha256(serialized.encode()).hexdigest()
+        artifact_path = None
+        work_dir = context.get("work_dir")
+        if work_dir:
+            path = Path(work_dir) / f"{artifact_id}.json"
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(serialized, encoding="utf-8")
+            temporary.replace(path)
+            artifact_path = str(path)
+        result["artifact"] = {
+            "artifact_id": artifact_id,
+            "artifact_path": artifact_path,
+            "sha256": artifact_sha256,
+            "schema_version": document["schema_version"],
+        }
+        return result
 
     def comparison(request: ToolRequest, _: dict[str, Any]) -> dict[str, Any]:
         reference_path = context.get("comparison_reference_path")
-        reference = json.loads(Path(reference_path).read_text(encoding="utf-8")) if reference_path else {}
+        from .runtime import read_json
+        reference = read_json(reference_path) if reference_path else {}
         if not isinstance(reference, dict) or not all(isinstance(k, str) and isinstance(v, list) for k, v in reference.items()):
             raise ValueError("ReferenceComparison JSON must map cell-type strings to marker lists")
         marker_sets = request.arguments.get("marker_sets")

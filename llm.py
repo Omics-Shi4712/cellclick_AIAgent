@@ -60,7 +60,7 @@ class JsonChatClient(Protocol):
 class OpenAIChatClient:
     """OpenAI Chat Completions adapter configured solely from environment variables."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, timeout=None, max_retries=None) -> None:
         from openai import AsyncOpenAI
 
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -69,12 +69,18 @@ class OpenAIChatClient:
         base_url = (os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or "").strip()
         if base_url.rstrip("/").endswith("/chat/completions"):
             base_url = base_url.rstrip("/")[: -len("/chat/completions")]
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url.rstrip("/") or None)
+        options = {}
+        if timeout is not None:
+            options["timeout"] = timeout
+        if max_retries is not None:
+            options["max_retries"] = max_retries
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url.rstrip("/") or None, **options)
 
     async def complete_json(
         self, *, system: str, user: str, schema: dict[str, Any], model: str, temperature: float,
         strict: bool = False,
     ) -> tuple[dict[str, Any], str]:
+        self.last_usage = {}
         system = ensure_json_system_instruction(system)
         request = {
             "model": model,
@@ -98,6 +104,9 @@ class OpenAIChatClient:
             response = await self._client.chat.completions.create(
                 **request, response_format={"type": "json_object"},
             )
+        usage = getattr(response, "usage", None)
+        self.last_usage = {key: getattr(usage, key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                           if isinstance(getattr(usage, key, None), int)}
         content = response.choices[0].message.content or ""
         try:
             value = json.loads(content)

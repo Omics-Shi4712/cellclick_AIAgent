@@ -6,6 +6,7 @@ import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+from .runtime import cached_statistics, load_expression, read_expression_manifest, CURRENT, gene_vector
 
 FOLD_CHANGE_EPSILON = 1e-9
 
@@ -39,7 +40,7 @@ def cluster_expression_evidence(*, expression_file: str | Path, manifest_file: s
         raise ValueError("top_n must be positive")
     expression_path = Path(expression_file).resolve()
     manifest_path = Path(manifest_file).resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_expression_manifest(manifest_path)
     if not isinstance(manifest, dict) or manifest.get("schema_version") != "cellclick.expression.2":
         raise ValueError("CellClick expression manifest has an unsupported schema")
     if manifest.get("h5ad_path") != str(expression_path):
@@ -60,14 +61,15 @@ def cluster_expression_evidence(*, expression_file: str | Path, manifest_file: s
     except (ImportError, ValueError) as error:
         raise RuntimeError("CellClick V5 expression evidence requires anndata, numpy, and scipy") from error
 
-    adata = ad.read_h5ad(expression_path)
+    adata = load_expression(expression_path)
     try:
         layer_name = str(manifest.get("statistics_layer", ""))
         if layer_name != "normalization+log1p" or layer_name not in adata.layers:
             raise ValueError("CellClick expression export lacks normalization+log1p statistics")
         if "cellclick_group_id" not in adata.obs:
             raise ValueError("CellClick expression export lacks cellclick_group_id")
-        target = adata.obs["cellclick_group_id"].astype(str).to_numpy() == groups[0]
+        runtime = CURRENT.get()
+        target = runtime.resources.masks[groups[0]] if runtime else adata.obs["cellclick_group_id"].astype(str).to_numpy() == groups[0]
         target_count = int(target.sum())
         rest_count = int((~target).sum())
         if target_count == 0 or rest_count == 0:
@@ -128,6 +130,7 @@ def marker_expression_evidence(*, expression_file: str | Path, manifest_file: st
     return {**result, "genes": rows}
 
 
+@cached_statistics
 def gene_statistics(*, expression_file: str | Path, manifest_file: str | Path,
                     source_row_id: str, genes: Iterable[str]) -> dict[str, Any]:
     """Return bounded target/background statistics for requested genes only."""
@@ -135,7 +138,7 @@ def gene_statistics(*, expression_file: str | Path, manifest_file: str | Path,
     if not requested or len(requested) > 200:
         raise ValueError("query_expression requires between 1 and 200 unique genes")
     expression_path = Path(expression_file).resolve()
-    manifest = json.loads(Path(manifest_file).read_text(encoding="utf-8"))
+    manifest = read_expression_manifest(manifest_file)
     groups = [str(group) for group, row_id in manifest.get("source_row_id_by_group", {}).items()
               if row_id == source_row_id]
     if manifest.get("h5ad_path") != str(expression_path) or len(groups) != 1:
@@ -146,15 +149,16 @@ def gene_statistics(*, expression_file: str | Path, manifest_file: str | Path,
         from scipy import sparse
     except (ImportError, ValueError) as error:
         raise RuntimeError("CellClick V5 expression evidence requires anndata, numpy, and scipy") from error
-    adata = ad.read_h5ad(expression_path)
+    adata = load_expression(expression_path)
     try:
         layer = manifest.get("statistics_layer")
         if layer != "normalization+log1p" or layer not in adata.layers or "cellclick_group_id" not in adata.obs:
             raise ValueError("expression export lacks required V5 statistics")
-        target = adata.obs["cellclick_group_id"].astype(str).to_numpy() == groups[0]
+        runtime = CURRENT.get()
+        target = runtime.resources.masks[groups[0]] if runtime else adata.obs["cellclick_group_id"].astype(str).to_numpy() == groups[0]
         if not target.any() or target.all():
             raise ValueError("expression target must have target and background cells")
-        index = {str(gene): position for position, gene in enumerate(adata.var_names.astype(str))}
+        index = runtime.resources.index if runtime else {str(gene): position for position, gene in enumerate(adata.var_names.astype(str))}
         matrix = adata.layers[layer]
         rows = []
         for gene in requested:
@@ -162,8 +166,7 @@ def gene_statistics(*, expression_file: str | Path, manifest_file: str | Path,
             if position is None:
                 rows.append({"gene": gene, "available": False})
                 continue
-            values = matrix[:, position]
-            values = values.toarray().ravel() if sparse.issparse(values) else np.asarray(values).ravel()
+            values = gene_vector(matrix, position, gene)
             target_values, background_values = values[target], values[~target]
             target_pct = float(np.count_nonzero(target_values > 0) / target_values.size)
             background_pct = float(np.count_nonzero(background_values > 0) / background_values.size)
@@ -201,7 +204,7 @@ def reference_expression_inputs(*, expression_file: str | Path, manifest_file: s
     if not requested:
         raise ValueError("reference_expression_inputs requires at least one gene")
     expression_path = Path(expression_file).resolve()
-    manifest = json.loads(Path(manifest_file).read_text(encoding="utf-8"))
+    manifest = read_expression_manifest(manifest_file)
     if manifest.get("h5ad_path") != str(expression_path):
         raise ValueError("expression manifest does not bind to supplied export")
     groups = sorted(str(group) for group, row in manifest.get("source_row_id_by_group", {}).items()
@@ -214,16 +217,17 @@ def reference_expression_inputs(*, expression_file: str | Path, manifest_file: s
         from scipy import sparse
     except (ImportError, ValueError) as error:
         raise RuntimeError("reference expression requires anndata, numpy, and scipy") from error
-    adata = ad.read_h5ad(expression_path)
+    adata = load_expression(expression_path)
     try:
         layer = manifest.get("statistics_layer")
         if layer not in adata.layers or "cellclick_group_id" not in adata.obs:
             raise ValueError("expression export lacks reference comparison layer/group")
-        index = {str(g): i for i, g in enumerate(adata.var_names.astype(str))}
-        labels = adata.obs["cellclick_group_id"].astype(str).to_numpy()
+        runtime = CURRENT.get()
+        index = runtime.resources.index if runtime else {str(g): i for i, g in enumerate(adata.var_names.astype(str))}
+        labels = runtime.resources.labels if runtime else adata.obs["cellclick_group_id"].astype(str).to_numpy()
         matrix = adata.layers[layer]
         all_groups = sorted(set(labels))
-        target_mask = labels == groups[0]
+        target_mask = runtime.resources.masks[groups[0]] if runtime else labels == groups[0]
         if not target_mask.any() or target_mask.all() or len(all_groups) < 2:
             raise ValueError("reference comparison requires target and background groups")
         vectors: dict[str, list[float]] = {}
@@ -235,10 +239,13 @@ def reference_expression_inputs(*, expression_file: str | Path, manifest_file: s
             if pos is None:
                 missing.append(gene)
                 continue
-            values = matrix[:, pos]
-            values = values.toarray().ravel() if sparse.issparse(values) else np.asarray(values).ravel()
+            values = gene_vector(matrix, pos, gene)
             vectors[gene] = [float(x) for x in values]
-            means[gene] = [float(values[labels == group].mean()) for group in all_groups]
+            def group_means():
+                return [float(values[runtime.resources.masks[group] if runtime else labels == group].mean()) for group in all_groups]
+            runtime = CURRENT.get()
+            means[gene] = list(runtime.resources.cache.get((runtime.resources.fingerprint, "group-means-v1", gene), group_means)
+                               if runtime else group_means())
             cell_expression[gene] = {f"cell_{i:09d}": float(value)
                                      for i, value in enumerate(values[target_mask])}
         target_cell_ids = [f"cell_{i:09d}" for i in range(int(target_mask.sum()))]
@@ -256,7 +263,7 @@ def gene_cosine_statistics(*, expression_file: str | Path, manifest_file: str | 
                            source_row_id: str, gene_sets: list[dict[str, Any]],
                            compare_pairs: list[list[str]]) -> dict[str, Any]:
     """Calculate target-cell cosine and joint detection without inferring mixture."""
-    import math
+    import numpy as np
 
     candidate_ids = [str(item.get("candidate_id", "")).strip() for item in gene_sets]
     if not candidate_ids or len(candidate_ids) != len(set(candidate_ids)) or any(not value for value in candidate_ids):
@@ -281,6 +288,13 @@ def gene_cosine_statistics(*, expression_file: str | Path, manifest_file: str | 
     available = {gene: [values[gene] for values in vectors["cell_expression"].values()]
                  for gene in vectors["available_genes"]}
     missing = set(vectors["missing_genes"])
+    arrays = {gene: np.asarray(values, dtype=np.float64) for gene, values in available.items()}
+    norms = {}
+    for gene, values in arrays.items():
+        runtime = CURRENT.get()
+        compute = lambda: float(np.linalg.norm(values))
+        norms[gene] = (runtime.resources.cache.get((runtime.resources.fingerprint, "norm-v1", source_row_id, gene), compute)
+                       if runtime else compute())
     gene_detection = {
         gene: {"available": gene in available,
                "detected_cells": (sum(value > 0 for value in available[gene]) if gene in available else None),
@@ -294,14 +308,13 @@ def gene_cosine_statistics(*, expression_file: str | Path, manifest_file: str | 
             return {"left_gene": left, "right_gene": right, "computable": False,
                     "reason": "missing_gene", "cosine": None}
         a, b = available[left], available[right]
-        left_norm = math.sqrt(sum(value * value for value in a))
-        right_norm = math.sqrt(sum(value * value for value in b))
+        left_norm, right_norm = norms[left], norms[right]
         if left_norm == 0 or right_norm == 0:
             return {"left_gene": left, "right_gene": right, "computable": False,
                     "reason": "zero_vector", "cosine": None}
-        joint = sum(1 for x, y in zip(a, b) if x > 0 and y > 0)
+        joint = int(np.count_nonzero((arrays[left] > 0) & (arrays[right] > 0)))
         return {"left_gene": left, "right_gene": right, "computable": True,
-                "cosine": round(sum(x * y for x, y in zip(a, b)) / (left_norm * right_norm), 6),
+                "cosine": round(float(arrays[left] @ arrays[right]) / (left_norm * right_norm), 6),
                 "left_detected": sum(value > 0 for value in a),
                 "right_detected": sum(value > 0 for value in b),
                 "joint_detected": joint,

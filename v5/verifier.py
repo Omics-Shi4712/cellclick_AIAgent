@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .context import build_llm_context
 from .ledger import make_target, observation_entry
 from .models import (QueryBuilderResponse, ResolutionAudit, ResolutionResponse, ToolObservation,
                      ToolRequest, V5State, VerificationQuestion, VerificationReport, VerifierResponse)
 from .prompts import QUERY_BUILDER_SYSTEM, RESOLVER_SYSTEM, VERIFIER_SYSTEM
 from .tools import ToolRegistry, parameter_hash
+from .runtime import read_json, CURRENT, load_expression, emit
 
 STATE_ACTIONS = {
     "multiple": ("check_expression", "query_expression"),
@@ -23,7 +25,7 @@ STATE_ACTIONS = {
 
 def reference_options(state: V5State, context: dict[str, Any], allowed: set[str]) -> dict[str, dict[str, Any]]:
     path = context.get("comparison_reference_path")
-    reference = json.loads(Path(path).read_text(encoding="utf-8")) if path else {}
+    reference = read_json(path) if path else {}
     options = {}
     for candidate in state.candidate_registry.candidates:
         if candidate.candidate_id not in allowed:
@@ -39,15 +41,20 @@ def reference_options(state: V5State, context: dict[str, Any], allowed: set[str]
 def _genes(values: list[str], context: dict[str, Any]) -> list[str]:
     """Canonicalize unambiguous gene names; keep missing names for coverage reporting."""
     if "_gene_names" not in context:
+        runtime = CURRENT.get()
+        if runtime:
+            context["_gene_names"] = runtime.resources.casefold_index
+    if "_gene_names" not in context:
         import anndata as ad
-        adata = ad.read_h5ad(context["expression_file"], backed="r")
+        adata = load_expression(context["expression_file"]) if CURRENT.get() else ad.read_h5ad(context["expression_file"], backed="r")
         try:
             index: dict[str, list[str]] = {}
             for value in adata.var_names.astype(str):
                 index.setdefault(value.casefold(), []).append(value)
             context["_gene_names"] = index
         finally:
-            adata.file.close()
+            if hasattr(adata, "file"):
+                adata.file.close()
     index = context["_gene_names"]
     result = []
     for value in values:
@@ -118,12 +125,14 @@ def dispatch_requests(state: V5State, requests: Iterable[ToolRequest], registry:
                 task_id=state.task.task_id, target_id=request.target_id, tool_name=request.tool_name,
                 status="protocol_error", parameter_hash=digest, limitations=["invalid_question_target_or_task"])
         elif digest in cache:
+            emit("tool_cache", cache_hit=True, tool_name=request.tool_name)
             original = cache[digest]
             observation = original.model_copy(update={"observation_id": f"OBS_{request.request_id}",
                                                        "request_id": request.request_id,
                                                        "evidence_ids": [],
                                                        "limitations": [*original.limitations, "cached_result"]})
         else:
+            emit("tool_cache", cache_hit=False, tool_name=request.tool_name)
             observation = registry.dispatch(request, context)
             if observation.status == "success":
                 cache[digest] = observation
@@ -166,14 +175,10 @@ async def verify(state: V5State, *, scope: str, client: Any, model: str, tempera
     trigger = "max_rounds_reached"
 
     def payload() -> dict[str, Any]:
-        return {"task": state.task.model_dump(), "scope": scope, "state": active,
+        return {**build_llm_context(state), "scope": scope, "state": active,
                 "rounds_used": state.rounds[scope], "max_rounds": max_rounds,
-                "candidate_registry": state.candidate_registry.model_dump(),
                 "allowed_candidate_ids": sorted(allowed), "allowed_parent_ids": sorted(parent_ids),
-                "pending_candidate_id": pending, "reference_options": options,
-                "marker_audit": state.marker_audit.model_dump() if state.marker_audit else None,
-                "evidence_ledger": [item.model_dump() for item in state.evidence_store],
-                "verification_history": list(state.verification_history)}
+                "pending_candidate_id": pending, "reference_options": options}
 
     for cycle in range(1, max_rounds + 1):
         state.rounds[scope] = cycle
@@ -244,7 +249,7 @@ async def verify(state: V5State, *, scope: str, client: Any, model: str, tempera
         latest = await complete(
             client, state, system=VERIFIER_SYSTEM, recipient="LLM_A", stage=f"{scope}_assessment",
             model=model, temperature=temperature, retries=retries, response_type=VerifierResponse,
-            payload={**payload(), "observation": observation.model_dump()}, semantic_validator=validate)
+            payload={**payload(), **build_llm_context(state, observation)}, semantic_validator=validate)
         next_state = latest.next_state
         if next_state == "validation":
             pending = latest.candidate_id

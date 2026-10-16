@@ -9,6 +9,8 @@ import os
 import re
 import tempfile
 import time
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,6 +24,8 @@ CL_ID = re.compile(r"^CL:\d+$")
 _INDEX_CACHE: dict[tuple[str, str], "CLEmbeddingIndex"] = {}
 _QUERY_CACHE: dict[tuple[str, str], list[float]] = {}
 _CL_NAMES_CACHE: dict[str, dict[str, str]] = {}
+_INDEX_LOCK = threading.RLock()
+_LABEL_LOCKS = [threading.RLock() for _ in range(64)]
 
 def normalize_label(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
@@ -35,7 +39,16 @@ def _load_map(path: Path = MAPPING_CACHE) -> dict[str, dict[str, str]]:
         return {normalize_label(row.get("label_normalized") or row.get("label_original") or ""): row
                 for row in csv.DictReader(handle, delimiter="\t") if normalize_label(row.get("label_normalized") or row.get("label_original") or "")}
 
-def _save_map(path: Path, rows: dict[str, dict[str, str]]) -> None:
+def _save_map(path: Path, rows: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(path.suffix + ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        merged = {**rows, **_load_map(path)}
+        _replace_map(path, merged)
+        return merged
+
+def _replace_map(path: Path, rows: dict[str, dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=path.name, dir=path.parent)
     os.close(fd)
@@ -111,9 +124,10 @@ class CLEmbeddingIndex:
 
 def _get_index(embedding_path: Path, obo_path: Path) -> CLEmbeddingIndex:
     key = (str(embedding_path.resolve()), str(obo_path.resolve()))
-    if key not in _INDEX_CACHE:
-        _INDEX_CACHE[key] = CLEmbeddingIndex(embedding_path, obo_path)
-    return _INDEX_CACHE[key]
+    with _INDEX_LOCK:
+        if key not in _INDEX_CACHE:
+            _INDEX_CACHE[key] = CLEmbeddingIndex(embedding_path, obo_path)
+        return _INDEX_CACHE[key]
 
 
 def _embedding(label: str, *, cache: Path, model: str, api_key_env: str, timeout: float = 30.0) -> list[float]:
@@ -122,6 +136,46 @@ def _embedding(label: str, *, cache: Path, model: str, api_key_env: str, timeout
         return _QUERY_CACHE[cache_key]
     api_key = os.environ.get(api_key_env)
     if not api_key: raise RuntimeError(f"{api_key_env} is required for embedding cache miss")
+    from .runtime import CURRENT, emit
+    runtime = CURRENT.get()
+    if runtime:
+        import httpx
+        from cellclick.retry import retry_kind, retry_delay
+        endpoint = (os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or "https://api.openlux.ai/v1").rstrip("/")
+        if endpoint.endswith("/chat/completions"):
+            endpoint = endpoint[:-len("/chat/completions")]
+        for attempt in range(3):
+            started = time.perf_counter()
+            try:
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                async def request():
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(runtime.read_timeout,
+                                                                       connect=runtime.connect_timeout)) as client:
+                        response = await client.post(endpoint + "/embeddings",
+                            json={"model": model, "input": [label]},
+                            headers={"Authorization": "Bearer " + api_key})
+                        response.raise_for_status()
+                        return response.json()["data"][0]["embedding"]
+                async def bounded():
+                    return await asyncio.wait_for(request(), timeout=runtime.total_timeout)
+                # Registration is synchronous inside the graph's event loop.
+                # A separate loop lets cancellation close the embedding socket
+                # at the same total deadline as chat requests.
+                with ThreadPoolExecutor(max_workers=1) as transport:
+                    vector = transport.submit(lambda: asyncio.run(bounded())).result()
+                _QUERY_CACHE[cache_key] = vector
+                emit("embedding_attempt", attempt=attempt + 1, status="ok", duration_seconds=time.perf_counter()-started)
+                return vector
+            except Exception as error:
+                if isinstance(error, httpx.HTTPStatusError):
+                    error.status_code = error.response.status_code
+                kind = retry_kind(error)
+                emit("embedding_attempt", attempt=attempt + 1, status="error", error_type=type(error).__name__, error_kind=kind,
+                     duration_seconds=time.perf_counter()-started)
+                if kind != "transient" or attempt == 2:
+                    raise
+                time.sleep(retry_delay(error, .25 * 2**attempt))
     import urllib.request
     endpoint = os.environ.get("OPENAI_BASE_URL", "https://api.openlux.ai/v1").rstrip("/")
     request = urllib.request.Request(endpoint + "/embeddings", data=json.dumps({"model": model, "input": [label]}).encode(), headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
@@ -129,6 +183,21 @@ def _embedding(label: str, *, cache: Path, model: str, api_key_env: str, timeout
     _QUERY_CACHE[cache_key] = vector
     return vector
 
+def _singleflight(function):
+    @wraps(function)
+    def wrapped(label, **kwargs):
+        from .runtime import CURRENT
+        runtime = CURRENT.get()
+        if runtime and runtime.mapping_path:
+            kwargs["mapping_path"] = runtime.mapping_path
+        path = kwargs.get("mapping_path", MAPPING_CACHE)
+        with _LABEL_LOCKS[int(hashlib.sha256(normalize_label(label).encode()).hexdigest(), 16) % 64]:
+            if runtime or kwargs.get("rows") is None:
+                kwargs["rows"] = _load_map(path)
+            return function(label, **kwargs)
+    return wrapped
+
+@_singleflight
 def map_label(label: str, *, mapping_path: Path = MAPPING_CACHE, embedding_path: Path = EMBEDDING_CACHE, obo_path: Path | None = None, threshold: float = .55, margin: float = 0.0, rows: dict[str, dict[str, str]] | None = None, index: CLEmbeddingIndex | None = None) -> dict[str, Any]:
     key = normalize_label(label); rows = rows if rows is not None else _load_map(mapping_path); row = rows.get(key)
     if row and _valid_cl(row.get("cl_id")):
@@ -157,12 +226,17 @@ def map_label(label: str, *, mapping_path: Path = MAPPING_CACHE, embedding_path:
     else: status, clid = "mapped", scored[0][1]
     canonical = next((item[2] for item in scored if item[1] == clid), "") if clid else ""
     rows[key] = {"label_normalized": key, "label_original": label, "cl_id": clid or "", "mapping_status": status, "canonical_label": canonical, "score": f"{top:.6f}", "margin": f"{gap:.6f}", "model": "text-embedding-3-small", "policy_version": "cellclick-v5.8-embedding"}
-    _save_map(mapping_path, rows)
+    committed = _save_map(mapping_path, rows)
+    if committed[key] != rows[key]:
+        return map_label(label, mapping_path=mapping_path, embedding_path=embedding_path,
+                         obo_path=obo_path, rows=committed, index=index)
     return {"cl_id": clid, "mapping_status": status, "canonical_label": canonical, "score": top, "margin": gap}
 
 def register_major(raw_candidates: Iterable[dict[str, Any]], *, version: int = 1, max_candidates: int = 5) -> CandidateRegistry:
     raw_candidates = list(raw_candidates)
-    mapping_path = MAPPING_CACHE
+    from .runtime import CURRENT
+    runtime = CURRENT.get()
+    mapping_path = runtime.mapping_path if runtime and runtime.mapping_path else MAPPING_CACHE
     rows = _load_map(mapping_path)
     obo_path = Path(__file__).resolve().parents[4] / "evaluator" / "ref_data" / "cl.obo"
     pending = [str(raw.get("label", "")).strip() for raw in raw_candidates
@@ -173,7 +247,7 @@ def register_major(raw_candidates: Iterable[dict[str, Any]], *, version: int = 1
     for raw in raw_candidates:
         label = str(raw.get("label", "")).strip()
         if not label: continue
-        mapped = map_label(label, rows=rows, index=index)
+        mapped = map_label(label, mapping_path=mapping_path, rows=rows, index=index)
         normalized.append({**raw, **mapped, "original_label": label,
                            "canonical_label": mapped.get("canonical_label") or label})
     merged: list[dict[str, Any]] = []
