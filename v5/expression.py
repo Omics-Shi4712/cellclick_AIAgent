@@ -7,6 +7,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+FOLD_CHANGE_EPSILON = 1e-9
+
 
 def context_fingerprint(*, expression_path: str, manifest_path: str, target_id: str,
                          cell_set_fingerprint: str, genes: Iterable[str], parameters: Mapping[str, Any]) -> str:
@@ -165,15 +167,25 @@ def gene_statistics(*, expression_file: str | Path, manifest_file: str | Path,
             target_values, background_values = values[target], values[~target]
             target_pct = float(np.count_nonzero(target_values > 0) / target_values.size)
             background_pct = float(np.count_nonzero(background_values > 0) / background_values.size)
+            target_normalized_mean = float(np.expm1(target_values).mean())
+            background_normalized_mean = float(np.expm1(background_values).mean())
+            fold_change = ((target_normalized_mean + FOLD_CHANGE_EPSILON) /
+                           (background_normalized_mean + FOLD_CHANGE_EPSILON))
             rows.append({"gene": gene, "available": True,
                          "mean_log1p": round(float(target_values.mean()), 6),
                          "background_mean_log1p": round(float(background_values.mean()), 6),
                          "mean_difference": round(float(target_values.mean() - background_values.mean()), 6),
                          "pct_expressing": round(target_pct, 6),
                          "background_pct_expressing": round(background_pct, 6),
-                         "delta_pct": round(target_pct - background_pct, 6)})
+                         "delta_pct": round(target_pct - background_pct, 6),
+                         "fold_change": round(fold_change, 6),
+                         "log2_fold_change": round(float(np.log2(fold_change)), 6),
+                         "target_normalized_mean": round(target_normalized_mean, 6),
+                         "background_normalized_mean": round(background_normalized_mean, 6),
+                         "background_zero_expression": background_normalized_mean == 0.0})
         return {"source_row_id": source_row_id, "statistics_layer": layer,
-                "cell_count": int(target.sum()), "background_cell_count": int((~target).sum()), "genes": rows}
+                "cell_count": int(target.sum()), "background_cell_count": int((~target).sum()),
+                "fold_change_epsilon": FOLD_CHANGE_EPSILON, "genes": rows}
     finally:
         del adata
 
@@ -238,3 +250,76 @@ def reference_expression_inputs(*, expression_file: str | Path, manifest_file: s
                 "available_genes": sorted(vectors), "cell_count": len(target_cell_ids)}
     finally:
         del adata
+
+
+def gene_cosine_statistics(*, expression_file: str | Path, manifest_file: str | Path,
+                           source_row_id: str, gene_sets: list[dict[str, Any]],
+                           compare_pairs: list[list[str]]) -> dict[str, Any]:
+    """Calculate target-cell cosine and joint detection without inferring mixture."""
+    import math
+
+    candidate_ids = [str(item.get("candidate_id", "")).strip() for item in gene_sets]
+    if not candidate_ids or len(candidate_ids) != len(set(candidate_ids)) or any(not value for value in candidate_ids):
+        raise ValueError("gene_cosine gene_sets require unique non-empty candidate_id values")
+    normalized_sets: dict[str, list[str]] = {}
+    for item, candidate_id in zip(gene_sets, candidate_ids):
+        genes = list(dict.fromkeys(str(gene).strip() for gene in item.get("genes", []) if str(gene).strip()))
+        if not genes:
+            raise ValueError("gene_cosine each gene set requires at least one gene")
+        normalized_sets[candidate_id] = genes
+    normalized_pairs = []
+    for pair in compare_pairs:
+        if len(pair) != 2 or pair[0] not in normalized_sets or pair[1] not in normalized_sets or pair[0] == pair[1]:
+            raise ValueError("gene_cosine compare_pairs must cite two distinct supplied candidate IDs")
+        normalized_pairs.append([pair[0], pair[1]])
+    if not normalized_pairs:
+        raise ValueError("gene_cosine requires at least one compare pair")
+
+    genes = list(dict.fromkeys(gene for values in normalized_sets.values() for gene in values))
+    vectors = reference_expression_inputs(expression_file=expression_file, manifest_file=manifest_file,
+                                          source_row_id=source_row_id, genes=genes)
+    available = {gene: [values[gene] for values in vectors["cell_expression"].values()]
+                 for gene in vectors["available_genes"]}
+    missing = set(vectors["missing_genes"])
+    gene_detection = {
+        gene: {"available": gene in available,
+               "detected_cells": (sum(value > 0 for value in available[gene]) if gene in available else None),
+               "pct_expressing": (round(sum(value > 0 for value in available[gene]) / len(available[gene]), 6)
+                                  if gene in available and available[gene] else None)}
+        for gene in genes
+    }
+
+    def pair_result(left: str, right: str) -> dict[str, Any]:
+        if left in missing or right in missing:
+            return {"left_gene": left, "right_gene": right, "computable": False,
+                    "reason": "missing_gene", "cosine": None}
+        a, b = available[left], available[right]
+        left_norm = math.sqrt(sum(value * value for value in a))
+        right_norm = math.sqrt(sum(value * value for value in b))
+        if left_norm == 0 or right_norm == 0:
+            return {"left_gene": left, "right_gene": right, "computable": False,
+                    "reason": "zero_vector", "cosine": None}
+        joint = sum(1 for x, y in zip(a, b) if x > 0 and y > 0)
+        return {"left_gene": left, "right_gene": right, "computable": True,
+                "cosine": round(sum(x * y for x, y in zip(a, b)) / (left_norm * right_norm), 6),
+                "left_detected": sum(value > 0 for value in a),
+                "right_detected": sum(value > 0 for value in b),
+                "joint_detected": joint,
+                "joint_detected_fraction": round(joint / len(a), 6) if a else 0.0}
+
+    within = {candidate_id: [pair_result(genes[i], genes[j])
+                             for i in range(len(genes)) for j in range(i + 1, len(genes))]
+              for candidate_id, genes in normalized_sets.items()}
+    across = []
+    for left_id, right_id in normalized_pairs:
+        across.append({"left_candidate_id": left_id, "right_candidate_id": right_id,
+                       "gene_pairs": [pair_result(left, right)
+                                      for left in normalized_sets[left_id]
+                                      for right in normalized_sets[right_id]]})
+    zero = [gene for gene in genes if gene in available and not any(available[gene])]
+    return {"source_row_id": source_row_id, "statistics_layer": "normalization+log1p",
+            "cell_count": vectors["cell_count"], "gene_sets": normalized_sets,
+            "available_genes": sorted(available), "missing_genes": sorted(missing),
+            "zero_vector_genes": sorted(zero), "gene_detection": gene_detection,
+            "within_group": within, "cross_group": across,
+            "limitations": ["cosine_is_expression_evidence_not_a_mixture_call"]}

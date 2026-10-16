@@ -70,14 +70,17 @@ def compare_reference(*, query_markers: Sequence[str], reference_markers: Sequen
                       query_means: Mapping[str, Sequence[float]], reference_means: Mapping[str, Sequence[float]],
                       cosg_scores: Mapping[str, float], cell_expression: Mapping[str, Mapping[str, float]],
                       k: float = 0.5) -> dict[str, Any]:
+    valid_reference_markers = [gene for gene in reference_markers if gene in reference_vectors
+                               and gene in reference_means and gene in cosg_scores
+                               and all(gene in values for values in cell_expression.values())]
     gs = {gene: gene_similarity(query_vectors, gene, query_markers, reference_vectors, query_means, reference_means)
-          if gene not in query_markers else 1.0 for gene in reference_markers}
+          if gene not in query_markers else 1.0 for gene in valid_reference_markers}
     res = {gene: relative_expression_specificity(gene=gene, query_markers=query_markers,
-                                                  cosg_scores=cosg_scores) for gene in reference_markers}
+                                                  cosg_scores=cosg_scores) for gene in valid_reference_markers}
     ead = {cell: {gene: (1.0 if gene in query_markers else expression_abundance_difference(
         gene_expression=values.get(gene, 0.0),
         query_mean_expression=sum(values.get(q, 0.0) for q in query_markers) / len(query_markers), k=k))
-            for gene in reference_markers} for cell, values in cell_expression.items()}
+            for gene in valid_reference_markers} for cell, values in cell_expression.items()}
     result = cell_scores(query_markers=query_markers, reference_markers=reference_markers, gs=gs, res=res,
                          ead_by_cell=ead)
     missing_reference_vectors = [gene for gene in reference_markers if gene not in reference_vectors]
@@ -85,7 +88,7 @@ def compare_reference(*, query_markers: Sequence[str], reference_markers: Sequen
     if missing_reference_vectors:
         limitations.append("reference_expression_vectors_unavailable_for:" + ",".join(missing_reference_vectors))
     return {**result, "GS": gs, "RES": res, "EAD": ead, "k": k,
-            "calculation_mode": "query_expression_projection_v1",
+            "calculation_mode": "query_expression_all_cells_v3",
             "limitations": limitations}
 
 

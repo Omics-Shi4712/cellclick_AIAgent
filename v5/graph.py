@@ -1,29 +1,45 @@
-"""Single program-controlled V5.1 execution graph."""
+"""Program-controlled V5.8 execution graph."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
+from functools import lru_cache
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from cellclick.llm import JsonChatClient, close_json_client
 from cellclick.retry import retry_json
 from .expression import marker_expression_evidence
-from .ledger import make_target, snapshot_id
-from .models import (AdjudicationResponse, ArgumentDraftResponse, CandidateDraft, CandidateDraftResponse, CandidateProposal,
-    MajorCandidateResponse,
-    CandidateRegistry, EvidenceLedgerEntry, FinalAnnotation, MarkerAudit, MessageEnvelope,
-    ReferenceComparisonResult, TaskInput, ToolRequest, ToulminArgument, V5State, VerificationQuestion,
-    VerifierResponse)
-from .prompts import ADJUDICATOR_SYSTEM, MAJOR_TYPE_SYSTEM, MARKER_AUDIT_SYSTEM, PROMPT_VERSION, SUBTYPE_SYSTEM, VERIFIER_SYSTEM
+from .ledger import snapshot_id
+from .models import (AdjudicationResponse, CandidateDraft, CandidateProposal, MajorCandidateResponse,
+                     CandidateRegistry, EvidenceLedgerEntry, FinalAnnotation, MarkerAudit,
+                     MessageEnvelope, SubtypeCandidateResponse, TaskInput, V5State)
+from .prompts import (ADJUDICATOR_SYSTEM, MAJOR_TYPE_SYSTEM, MARKER_AUDIT_SYSTEM,
+                      PROMPT_VERSION, SUBTYPE_SYSTEM)
 from .tools import build_tool_registry
-from .verifier import dispatch_requests, report
-from .candidate_registry import register_major
+from .verifier import verify
+from .candidate_registry import register_major, register_subtype
 
 PROTOCOL_VERSION = "v5"
-ANNOTATION_CANDIDATES, MAX_ROUNDS, REQUEST_RETRIES, MAX_PARALLEL_CLUSTERS = 5, 4, 2, 1
-WORKFLOW_VERSION = "v5.6-reference-label-directory-expression-comparison"
+ANNOTATION_CANDIDATES, MAX_ROUNDS, REQUEST_RETRIES, MAX_PARALLEL_CLUSTERS = 5, 6, 2, 1
+WORKFLOW_VERSION = "v5.8-unified-verifier-state-machine"
+
+
+@lru_cache(maxsize=16)
+def _cached_file_sha256(path: str, size: int, mtime_ns: int) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_sha256(path: str) -> str:
+    resolved = Path(path).resolve()
+    info = resolved.stat()
+    return _cached_file_sha256(str(resolved), info.st_size, info.st_mtime_ns)
 
 # Labels that describe an expression program or technical state rather than
 # an identifiable cell type.  They are filtered before entering the registry
@@ -95,7 +111,9 @@ def _reference_evidence(task: TaskInput, packet: dict[str, Any]) -> EvidenceLedg
 
 
 def _register(drafts: Any, *, source: str, version: int, parent: CandidateProposal | None = None,
-              trusted_labels: list[str] | None = None, reference_max: int = 3) -> CandidateRegistry:
+              trusted_labels: list[str] | None = None, reference_max: int = 3,
+              subtype_catalog: list[dict[str, Any]] | None = None,
+              usable_evidence: set[str] | None = None) -> CandidateRegistry:
     if isinstance(drafts, MajorCandidateResponse):
         raw = []
         for item in drafts.selected_reference_candidates:
@@ -105,6 +123,18 @@ def _register(drafts: Any, *, source: str, version: int, parent: CandidatePropos
             raw.append({"label": item.label, "source": "marker_based", "reference_rank": None,
                         "evidence_ids": item.evidence_ids, "rationale": item.rationale})
         return register_major(raw, version=version)
+    if isinstance(drafts, SubtypeCandidateResponse):
+        if parent is None:
+            raise ValueError("subtype registration requires a supported parent")
+        usable = usable_evidence or set()
+        raw = []
+        for item in drafts.candidates:
+            evidence_ids = list(dict.fromkeys(item.evidence_ids))
+            if not set(evidence_ids) <= usable:
+                continue
+            raw.append({"cl_id": item.cl_id, "evidence_ids": evidence_ids, "rationale": item.rationale})
+        return register_subtype(raw, parent=parent, catalog=subtype_catalog or [], version=version,
+                                usable_evidence=usable)
     start = 20 if parent else 1
     proposals = [d for d in drafts.candidates if _is_biological_cell_type(d.label)]
     # Include reliable reference hits even when the LLM omitted them from its
@@ -132,235 +162,65 @@ def _register(drafts: Any, *, source: str, version: int, parent: CandidatePropos
         competing_by_id={v.candidate_id: [x for x in ids if x not in {v.candidate_id, v.parent_id}] for v in values})
 
 
+
 async def _complete(client: JsonChatClient, state: V5State, *, system: str, recipient: str, stage: str,
-                    payload: dict[str, Any], model: str, temperature: float, retries: int, response_type: Any,
-                    semantic_validator: Any | None = None) -> Any:
-    envelope = MessageEnvelope(message_id=f"M_{len(state.messages)+1:04d}", task_id=state.task.task_id,
-        target_id=state.task.cluster_id, sender="program", recipient=recipient, message_type=stage,
-        candidate_registry_version=state.candidate_registry.version, evidence_snapshot_id=snapshot_id(state.evidence_store), payload=payload)
+                    payload: dict[str, Any], model: str, temperature: float, retries: int,
+                    response_type: Any, semantic_validator: Any | None = None) -> Any:
+    envelope = MessageEnvelope(
+        message_id=f"M_{len(state.messages)+1:04d}", task_id=state.task.task_id,
+        target_id=state.task.cluster_id, sender="program", recipient=recipient,
+        message_type=stage, verification_scope=payload.get("scope"),
+        candidate_registry_version=state.candidate_registry.version,
+        evidence_snapshot_id=snapshot_id(state.evidence_store), payload=payload)
     state.messages.append(envelope)
+    scope = payload.get("scope")
     def validate(value: dict[str, Any]) -> Any:
-        if response_type is MajorCandidateResponse and isinstance(value, dict) and "candidates" in value:
-            legacy = value.get("candidates") or []
-            if legacy:
-                value = {
-                "marker_interpretations": [
-                    {"gene": gene, "primary_role": "lineage", "association": "legacy candidate response"}
-                    for gene in state.task.ordered_markers
-                ],
-                "selected_reference_candidates": [],
-                "marker_based_candidates": [
-                    {"label": item.get("label", ""), "evidence_ids": [], "rationale": "legacy response"}
-                    for item in legacy if isinstance(item, dict) and item.get("label")
-                ],
-                }
-        parsed = response_type.model_validate(value)
-        if semantic_validator is not None:
-            semantic_validator(parsed)
+        try:
+            parsed = response_type.model_validate(value)
+            if semantic_validator is not None:
+                semantic_validator(parsed)
+        except (ValueError, TypeError) as error:
+            state.verification_history.append({
+                "role": recipient, "scope": scope, "stage": stage,
+                "round": state.rounds.get(scope, 0), "status": "invalid",
+                "response": value, "error": str(error)})
+            raise
+        state.verification_history.append({
+            "role": recipient, "scope": scope, "stage": stage,
+            "round": state.rounds.get(scope, 0), "status": "valid", "response": parsed.model_dump()})
         return parsed
-    raw, _ = await retry_json(client, system=system, user=envelope.model_dump_json(), schema=response_type.model_json_schema(),
-        model=model, temperature=temperature, retries=retries, validator=validate, strict=True, stage=stage)
-    state.transition_history.append({"stage": stage, "message_id": envelope.message_id, "evidence_snapshot_id": envelope.evidence_snapshot_id})
-    return validate(raw)
+    value, _ = await retry_json(
+        client, system=system, user=envelope.model_dump_json(), schema=response_type.model_json_schema(),
+        model=model, temperature=temperature, retries=retries, validator=validate,
+        strict=True, stage=stage)
+    state.transition_history.append({"stage": stage, "message_id": envelope.message_id,
+                                     "evidence_snapshot_id": envelope.evidence_snapshot_id})
+    return response_type.model_validate(value)
 
 
-def _status_map(response: VerifierResponse) -> dict[str, str]:
-    return {item.candidate_id: item.status for item in response.candidate_status}
+async def _verify(state: V5State, **kwargs: Any):
+    return await verify(state, complete=_complete, **kwargs)
 
 
-def _normalize_argument_drafts(drafts: ArgumentDraftResponse, state: V5State, *, allowed: set[str]) -> ArgumentDraftResponse:
-    """Bind model-proposed arguments to program-owned candidate/evidence IDs."""
-    candidates = {v.candidate_id for v in state.candidate_registry.candidates}
-    evidence = {v.evidence_id for v in state.evidence_store if v.usable}
-    normalized = []
-    for draft in drafts.arguments:
-        if draft.hypothesis_id not in candidates or draft.hypothesis_id not in allowed:
-            continue
-        bound_evidence = list(dict.fromkeys(item for item in draft.grounds_evidence_ids if item in evidence))
-        if not bound_evidence:
-            continue
-        normalized.append(draft.model_copy(update={"grounds_evidence_ids": bound_evidence}))
-    return ArgumentDraftResponse(arguments=normalized)
+def _query_subtype_catalog(parent: CandidateProposal) -> tuple[list[dict[str, Any]], str | None]:
+    if not parent.cl_id:
+        return [], "parent_cl_id_missing"
+    try:
+        from evaluator.solver.CLSolver import CLSolver
+        catalog = CLSolver().get_children(parent.cl_id)
+    except Exception as error:
+        return [], f"catalog_query_failed:{type(error).__name__}:{error}"
+    if not catalog:
+        return [], "catalog_empty"
+    return catalog, None
 
 
-def _normalize_verifier_response(response: VerifierResponse, *, allowed: set[str], evidence: set[str]) -> VerifierResponse:
-    """Convert a verifier suggestion into a complete bounded program record."""
-    statuses = {}
-    for item in response.candidate_status:
-        if item.candidate_id in allowed and item.candidate_id not in statuses:
-            statuses[item.candidate_id] = item.status
-    candidate_status = [
-        {"candidate_id": candidate_id, "status": statuses.get(candidate_id, "insufficient_evidence")}
-        for candidate_id in sorted(allowed)
-    ]
-    requests = []
-    for request in response.tool_requests[:2]:
-        hypothesis_ids = list(dict.fromkeys(item for item in request.hypothesis_ids if item in allowed))
-        if hypothesis_ids:
-            requests.append(request.model_copy(update={"hypothesis_ids": hypothesis_ids}))
-    action = response.action
-    if action == "request_tools" and not requests:
-        action = "unresolved"
-    return VerifierResponse.model_validate({
-        **response.model_dump(),
-        "action": action,
-        "candidate_status": candidate_status,
-        "supporting_evidence_ids": list(dict.fromkeys(item for item in response.supporting_evidence_ids if item in evidence)),
-        "conflicting_evidence_ids": list(dict.fromkeys(item for item in response.conflicting_evidence_ids if item in evidence)),
-        "tool_requests": requests,
+def _record_subtype_skip(state: V5State, reason: str) -> None:
+    state.transition_history.append({
+        "stage": "subtype_candidates",
+        "status": "skipped",
+        "reason": reason,
     })
-
-
-def _normalize_adjudication(response: AdjudicationResponse, *, evidence: set[str], arguments: set[str]) -> AdjudicationResponse:
-    annotations = [item.model_copy(update={
-        "evidence_ids": list(dict.fromkeys(value for value in item.evidence_ids if value in evidence)),
-    }) for item in response.population_annotations]
-    return AdjudicationResponse.model_validate({
-        **response.model_dump(),
-        "supporting_evidence_ids": list(dict.fromkeys(item for item in response.supporting_evidence_ids if item in evidence)),
-        "accepted_argument_ids": list(dict.fromkeys(item for item in response.accepted_argument_ids if item in arguments)),
-        "population_annotations": [item.model_dump() for item in annotations],
-    })
-
-
-def _candidate_label(value: str | None, state: V5State, *, granularity: str | None = None) -> str | None:
-    """Resolve internal candidate handles and canonicalize returned labels."""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    normalized = value.strip()
-    candidates = [item for item in state.candidate_registry.candidates
-                  if granularity is None or item.granularity == granularity]
-    by_id = {item.candidate_id: item.label for item in candidates}
-    if normalized in by_id:
-        return by_id[normalized]
-    by_label = {" ".join(item.label.casefold().split()): item.label for item in candidates}
-    return by_label.get(" ".join(normalized.casefold().split()))
-
-
-def _all_uncertain(response: VerifierResponse) -> bool:
-    return bool(response.candidate_status) and all(
-        item.status in {"uncertain", "insufficient_evidence"}
-        for item in response.candidate_status
-    )
-
-
-def _reference_fallback(state: V5State, *, allowed: set[str]) -> tuple[str, dict[str, Any]] | None:
-    """Select a dominant reference hit only when its margin is auditable."""
-    entry = next((item for item in state.evidence_store
-                  if item.source == "initial_cellmarker_retrieval" and item.usable), None)
-    hits = entry.payload.get("hits", []) if entry else []
-    if not isinstance(hits, list) or not hits:
-        return None
-    candidates = {" ".join(item.label.casefold().split()): item for item in state.candidate_registry.candidates
-                  if item.candidate_id in allowed}
-    ranked = []
-    for hit in hits:
-        if not isinstance(hit, dict):
-            continue
-        candidate = candidates.get(" ".join(str(hit.get("label", "")).casefold().split()))
-        score = hit.get("score")
-        if candidate is not None and isinstance(score, (int, float)):
-            ranked.append((float(score), candidate))
-    ranked.sort(key=lambda item: (-item[0], item[1].candidate_id))
-    if not ranked:
-        return None
-    top_score, top = ranked[0]
-    second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-    gap = top_score - second_score
-    # Require both useful absolute support and a non-trivial margin. This keeps
-    # fallback deterministic without turning every ambiguous reference list into
-    # a forced prediction.
-    if top_score < 0.45 or gap < 0.05:
-        return None
-    return top.label, {
-        "source_evidence_id": entry.evidence_id, "candidate_id": top.candidate_id,
-        "top_score": top_score, "second_score": second_score, "score_gap": gap,
-    }
-
-
-def _arguments(drafts: ArgumentDraftResponse, state: V5State) -> list[ToulminArgument]:
-    candidates = {v.candidate_id for v in state.candidate_registry.candidates}; evidence = {v.evidence_id for v in state.evidence_store if v.usable}
-    values = []
-    for i, d in enumerate(drafts.arguments, len(state.arguments)+1):
-        if d.hypothesis_id not in candidates or not set(d.grounds_evidence_ids) <= evidence: raise ValueError("argument cites unknown candidate or evidence")
-        values.append(ToulminArgument(argument_id=f"ARG_{i:03d}", revision=state.rounds["major"] + state.rounds["subtype"] + 1,
-            target_id=state.task.cluster_id, hypothesis_id=d.hypothesis_id, claim_type=d.claim_type, claim=d.claim,
-            grounds_evidence_ids=d.grounds_evidence_ids, qualifier_strength=d.qualifier_strength,
-            supported_granularity=d.supported_granularity, limitations=d.limitations, rebuttals=d.rebuttals))
-    return values
-
-
-async def _verify(state: V5State, *, scope: str, client: JsonChatClient, model: str, temperature: float, retries: int, tools: Any, context: dict[str, Any]):
-    candidates = [v for v in state.candidate_registry.candidates if v.granularity == scope]
-    context["allowed_candidate_ids"] = {v.candidate_id for v in candidates}
-    context["allow_score_patterns"] = bool(scope == "subtype" and state.reference_comparisons)
-    target = make_target(target_id=f"T_{scope.upper()}_{len(state.verification_targets)+1:03d}", task_id=state.task.task_id,
-        source_target_id=state.task.cluster_id, cell_barcodes=[], supported_parent_ids=[v.parent_id for v in candidates if v.parent_id], reason=f"{scope}_verification")
-    state.verification_targets.append(target)
-    question = VerificationQuestion(question_id=f"Q_{scope.upper()}_{len(state.questions)+1:03d}",
-        description=f"Which {scope} candidate is best supported by trusted evidence?", hypothesis_ids=[v.candidate_id for v in candidates],
-        affected_level=scope, queryable=True, blocks_acceptance_of=[v.candidate_id for v in candidates])
-    state.questions.append(question)
-    allowed = {v.candidate_id for v in candidates}
-    latest = None; latest_report = None
-    for cycle in range(1, MAX_ROUNDS + 1):
-        state.rounds[scope] = cycle
-        drafts = await _complete(client, state, system=VERIFIER_SYSTEM, recipient="Verifier", stage=f"{scope}_arguments", model=model, temperature=temperature, retries=retries,
-            response_type=ArgumentDraftResponse, payload={"task": state.task.model_dump(), "scope": scope, "candidate_registry": state.candidate_registry.model_dump(), "evidence_ledger": [v.model_dump() for v in state.evidence_store], "remaining_budget": state.budget, "available_tools": list(tools.names()), "available_reference_labels": context.get("available_reference_labels", []) if scope == "subtype" else []},
-            semantic_validator=None)
-        drafts = _normalize_argument_drafts(drafts, state, allowed=allowed)
-        state.arguments.extend(_arguments(drafts, state))
-        evidence = {v.evidence_id for v in state.evidence_store}
-        # Expose only candidates at the level currently being verified.  The
-        # full registry may also contain subtype candidates; including those
-        # invites the verifier to return statuses for out-of-scope hypotheses,
-        # which correctly fail the strict semantic validation below.
-        scoped_registry = {
-            "version": state.candidate_registry.version,
-            "candidates": [v.model_dump() for v in candidates],
-        }
-        latest = await _complete(client, state, system=VERIFIER_SYSTEM, recipient="Verifier", stage=f"verify_{scope}", model=model, temperature=temperature, retries=retries,
-            response_type=VerifierResponse, payload={"task": state.task.model_dump(), "scope": scope,
-                "allowed_candidate_ids": sorted(allowed), "candidate_registry": scoped_registry,
-                "arguments": [v.model_dump() for v in state.arguments], "questions": [question.model_dump()],
-                "evidence_ledger": [v.model_dump() for v in state.evidence_store],
-                "unresolved_questions": latest_report.unresolved_questions if latest_report else [],
-                "remaining_budget": state.budget, "available_tools": list(tools.names()),
-                "available_reference_labels": context.get("available_reference_labels", []) if scope == "subtype" else []},
-            semantic_validator=None)
-        latest = _normalize_verifier_response(latest, allowed=allowed, evidence=evidence)
-        status_map = _status_map(latest)
-        latest_report = report(state=state, report_id=f"VR_{scope.upper()}_{cycle:02d}", target_id=target.target_id, scope=scope,
-            candidate_status=status_map, supporting=latest.supporting_evidence_ids, conflicting=latest.conflicting_evidence_ids,
-            revision_requests=[{"request": item} for item in latest.revision_requests], unresolved=latest.unresolved_questions, stop_reason=latest.stop_reason)
-        if scope == "major" and cycle == 1 and latest.action != "request_tools" and _all_uncertain(latest):
-            request = ToolRequest(
-                request_id="REQ_MAJOR_01_AUTO", task_id=state.task.task_id, question_id=question.question_id,
-                target_id=target.target_id, tool_name="query_cellmarker",
-                hypothesis_ids=sorted(allowed), purpose="resolve_all_uncertain_major_candidates",
-                discriminating_question="Which major candidate has the strongest marker-reference support?",
-                arguments={"genes": state.task.ordered_markers},
-            )
-            dispatch_requests(state, [request], tools, context)
-            continue
-        if latest.action != "request_tools": return latest, latest_report
-        requests = [ToolRequest(request_id=f"REQ_{scope.upper()}_{cycle:02d}_{index:02d}",
-            task_id=state.task.task_id, question_id=question.question_id, target_id=target.target_id,
-            tool_name=draft.tool_name, hypothesis_ids=draft.hypothesis_ids,
-            purpose=draft.purpose, discriminating_question=draft.discriminating_question,
-            arguments=draft.arguments.model_dump()) for index, draft in enumerate(latest.tool_requests, 1)]
-        observations = dispatch_requests(state, requests, tools, context)
-        for observation in observations:
-            if observation.tool_name == "compare_reference" and observation.status == "success" and observation.result:
-                value = observation.result
-                context.setdefault("comparison_ids", set()).add(value.get("comparison_id"))
-                state.reference_comparisons.append(ReferenceComparisonResult(comparison_id=f"RC_{len(state.reference_comparisons)+1:03d}", target_id=target.target_id,
-                    candidate_ids=list(observation.result.get("candidate_ids", requests[0].hypothesis_ids if requests else [])),
-                    labels=list(value.get("labels", [])), reference_version=value["reference_version"], calculation_mode=value["calculation_mode"], score_matrix_handle=value["score_matrix_handle"], scores=value["scores"], decompositions=value["decompositions"], valid_markers=value["valid_markers"], coverage=value["coverage"], limitations=value.get("limitations", [])))
-                if scope == "subtype" and "inspect_score_patterns" not in tools.names():
-                    context["allow_score_patterns"] = True
-                    tools = build_tool_registry(context)
-    return latest, latest_report
 
 
 async def _workflow(state: V5State, *, client: JsonChatClient, model: str, temperature: float, retries: int, context: dict[str, Any]) -> V5State:
@@ -387,145 +247,227 @@ async def _workflow(state: V5State, *, client: JsonChatClient, model: str, tempe
     major = await _complete(client, state, system=MAJOR_TYPE_SYSTEM, recipient="MajorType", stage="major_candidates", model=model, temperature=temperature, retries=retries, response_type=MajorCandidateResponse, payload={"task": state.task.model_dump(), "marker_audit": audit.model_dump(), "reference_candidates": reference_candidates, "reference_max": reference_max, "marker_based_max": 5 - reference_max, "evidence_ledger": [v.model_dump() for v in state.evidence_store]}, semantic_validator=validate_major)
     state.candidate_registry = _register(major, source="MajorType", version=1, reference_max=reference_max)
     if not state.candidate_registry.candidates:
-        state.final_result = FinalAnnotation(execution_status="success", annotation_status="unresolved", accepted_level="none", stop_reason="no_major_candidates")
-        return state
-    major_context = dict(context); major_context["comparison_reference_path"] = None
-    major_tools = build_tool_registry(major_context)
-    major_reply, major_report = await _verify(state, scope="major", client=client, model=model, temperature=temperature, retries=retries, tools=major_tools, context=major_context)
-    major_supported = [v for v in state.candidate_registry.candidates if v.granularity == "major" and major_report.candidate_status.get(v.candidate_id) == "supported"]
+        raise ValueError("no_major_candidates: no legal biological identity was registered")
+    major_report = await _verify(state, scope="major", client=client, model=model, temperature=temperature,
+                                 retries=retries, tools=build_tool_registry(context), context=context)
+    original_major_registry = state.candidate_registry
+    major_supported = [v for v in state.candidate_registry.candidates
+                       if v.candidate_id == major_report.selected_candidate_id]
     subtype_report = None
-    if major_reply.action == "advance_subtype" and major_supported:
+    if major_supported:
         parent = major_supported[0]
-        subtype = await _complete(client, state, system=SUBTYPE_SYSTEM, recipient="SubType", stage="subtype_candidates", model=model, temperature=temperature, retries=retries, response_type=CandidateDraftResponse, payload={"task": state.task.model_dump(), "parent_candidate": parent.model_dump(), "evidence_ledger": [v.model_dump() for v in state.evidence_store]})
-        state.candidate_registry = _register(subtype, source="SubType", version=2, parent=parent)
-        subtype_tools = build_tool_registry(context)
-        _, subtype_report = await _verify(state, scope="subtype", client=client, model=model, temperature=temperature, retries=retries, tools=subtype_tools, context=context)
-    evidence = {v.evidence_id for v in state.evidence_store}; arguments = {v.argument_id for v in state.arguments}
-    decision = await _complete(client, state, system=ADJUDICATOR_SYSTEM, recipient="Adjudicator", stage="adjudication", model=model, temperature=temperature, retries=retries, response_type=AdjudicationResponse, payload={"task": state.task.model_dump(), "candidate_registry": state.candidate_registry.model_dump(), "arguments": [v.model_dump() for v in state.arguments], "verification_reports": [v.model_dump() for v in state.verification_reports], "questions": [v.model_dump() for v in state.questions], "evidence_ledger": [v.model_dump() for v in state.evidence_store]})
-    decision = _normalize_adjudication(decision, evidence=evidence, arguments=arguments)
-    subtype_labels = {v.label for v in state.candidate_registry.candidates if v.granularity == "subtype" and subtype_report and subtype_report.candidate_status.get(v.candidate_id) == "supported"}
-    status = decision.annotation_status
-    fallback = None
-    fallback_audit = None
-    decision_identity = _candidate_label(decision.identity, state, granularity="major")
-    decision_subtype = _candidate_label(decision.subtype, state, granularity="subtype")
-    if status == "accepted" and decision_subtype not in subtype_labels: status = "major_accepted_subtype_unresolved" if major_supported else "unresolved"
-    if status == "major_accepted_subtype_unresolved" and not major_supported: status = "unresolved"
-    supported_major_labels = {item.label for item in major_supported}
-    identity = decision_identity if decision_identity in supported_major_labels else None
-    identity = identity or (major_supported[0].label if status == "major_accepted_subtype_unresolved" and major_supported else None)
+        subtype_catalog, catalog_error = _query_subtype_catalog(parent)
+        if catalog_error:
+            _record_subtype_skip(state, catalog_error)
+        else:
+            usable = {entry.evidence_id for entry in state.evidence_store if entry.usable}
+            def validate_subtype(value: SubtypeCandidateResponse) -> None:
+                allowed = {str(item.get("cl_id")) for item in subtype_catalog}
+                for item in value.candidates:
+                    if item.cl_id not in allowed or item.cl_id == parent.cl_id:
+                        raise ValueError("subtype candidate CLID is outside the supplied catalog")
+                    if not set(item.evidence_ids) <= usable:
+                        raise ValueError("subtype candidate cites unknown or unusable evidence")
 
-    # If subtype evidence is unavailable, retain the highest-proportion
-    # biological major annotation.  This is deliberately label-agnostic: the
-    # candidate prompt filters technical expression programs, and the lookup
-    # below prevents one from being promoted if it still appears in a model
-    # response.  The proportion is a ranking signal, not a hard confidence
-    # threshold.
-    if status == "unresolved" and decision.population_annotations:
-        major_labels = {candidate.label for candidate in state.candidate_registry.candidates if candidate.granularity == "major"}
-        biological_annotations = [item for item in decision.population_annotations
-                                   if item.fraction is not None and item.label in major_labels
-                                   and _is_biological_cell_type(item.label)]
-        if biological_annotations:
-            dominant = max(biological_annotations, key=lambda item: item.fraction)
-            status = "major_accepted_subtype_unresolved"
-            identity = dominant.label
-    if status == "unresolved":
-        fallback = _reference_fallback(state, allowed={item.candidate_id for item in state.candidate_registry.candidates
-                                                       if item.granularity == "major"})
-        if fallback is not None:
-            identity, fallback_audit = fallback
-            status = "major_accepted_subtype_unresolved"
-            decision.stop_reason = "deterministic_reference_fallback"
-    # ``AdjudicationResponse`` stores typed ``PopulationAnnotation`` models,
-    # while the persisted ``FinalAnnotation`` contract intentionally exposes
-    # these entries as plain dictionaries.  Serialize explicitly here rather
-    # than passing model instances into the stricter list[dict] field.
-    state.final_result = FinalAnnotation(execution_status="success", annotation_status=status, identity=identity, subtype=decision_subtype if status == "accepted" else None, accepted_level="subtype" if status == "accepted" else ("major" if status == "major_accepted_subtype_unresolved" else ("composition" if status == "mixture" else "none")), cluster_summary=decision.cluster_summary, population_annotations=[item.model_dump() for item in decision.population_annotations], unresolved_questions=decision.unresolved_questions, supporting_evidence_ids=decision.supporting_evidence_ids, accepted_argument_ids=decision.accepted_argument_ids, fallback_audit=fallback_audit if fallback is not None else None, stop_reason=decision.stop_reason)
+            subtype = await _complete(
+                client, state, system=SUBTYPE_SYSTEM, recipient="SubType", stage="subtype_candidates",
+                model=model, temperature=temperature, retries=retries,
+                response_type=SubtypeCandidateResponse,
+                payload={"task": state.task.model_dump(), "parent_candidate": parent.model_dump(),
+                         "marker_audit": audit.model_dump(), "subtype_catalog": subtype_catalog,
+                         "evidence_ledger": [v.model_dump() for v in state.evidence_store]},
+                semantic_validator=validate_subtype,
+            )
+            state.candidate_registry = _register(
+                subtype, source="SubType", version=2, parent=parent,
+                subtype_catalog=subtype_catalog, usable_evidence=usable,
+            )
+            child_ids = {v.candidate_id for v in state.candidate_registry.candidates if v.granularity == "subtype"}
+            merged = {v.candidate_id: v for v in original_major_registry.candidates}
+            merged.update({v.candidate_id: v for v in state.candidate_registry.candidates})
+            state.candidate_registry = CandidateRegistry(
+                version=2, candidates=list(merged.values()),
+                parent_by_id={key: value.parent_id for key, value in merged.items()},
+                competing_by_id={key: value.competing_candidate_ids for key, value in merged.items()})
+            if not child_ids:
+                _record_subtype_skip(state, "zero_candidates")
+            else:
+                subtype_tools = build_tool_registry(context)
+                subtype_report = await _verify(state, scope="subtype", client=client, model=model, temperature=temperature, retries=retries, tools=subtype_tools, context=context)
+
+    authoritative_report = subtype_report or major_report
+    chosen = next(item for item in state.candidate_registry.candidates
+                  if item.candidate_id == authoritative_report.selected_candidate_id)
+    parents = {item.candidate_id: item for item in state.candidate_registry.candidates}
+    expected_identity = parents[chosen.parent_id].label if chosen.granularity == "subtype" else chosen.label
+    expected_subtype = chosen.label if chosen.granularity == "subtype" else None
+    expected_status = "accepted" if chosen.granularity == "subtype" else "major_accepted_subtype_unresolved"
+    usable_evidence = {item.evidence_id for item in state.evidence_store if item.usable}
+    argument_ids = {item.argument_id for item in state.arguments}
+
+    def validate_adjudication(value: AdjudicationResponse) -> None:
+        required = {
+            "selected_candidate_id": chosen.candidate_id,
+            "annotation_status": expected_status,
+            "identity": expected_identity,
+            "subtype": expected_subtype,
+            "verification_status": authoritative_report.verification_status,
+            "verification_report_id": authoritative_report.report_id,
+        }
+        for field, expected in required.items():
+            if getattr(value, field) != expected:
+                raise ValueError(f"{field}: must be {expected!r} according to terminal report "
+                                 f"{authoritative_report.report_id}; rewrite the complete decision consistently")
+        if not value.cluster_summary.strip():
+            raise ValueError("cluster_summary: give a non-empty explanation consistent with the selected identity")
+        if not value.supporting_evidence_ids or not set(value.supporting_evidence_ids) <= usable_evidence:
+            raise ValueError(f"supporting_evidence_ids: cite usable IDs from {sorted(usable_evidence)}")
+        if not set(authoritative_report.supporting_evidence_ids) <= set(value.supporting_evidence_ids):
+            raise ValueError("supporting_evidence_ids: retain the terminal report evidence")
+        if not set(value.accepted_argument_ids) <= argument_ids:
+            raise ValueError(f"accepted_argument_ids: legal IDs are {sorted(argument_ids)}")
+
+    decision = await _complete(
+        client, state, system=ADJUDICATOR_SYSTEM, recipient="Adjudicator", stage="adjudication",
+        model=model, temperature=temperature, retries=retries, response_type=AdjudicationResponse,
+        payload={"task": state.task.model_dump(), "candidate_registry": state.candidate_registry.model_dump(),
+                 "authoritative_report_id": authoritative_report.report_id,
+                 "arguments": [item.model_dump() for item in state.arguments],
+                 "verification_reports": [item.model_dump() for item in state.verification_reports],
+                 "verification_history": list(state.verification_history),
+                 "evidence_ledger": [item.model_dump() for item in state.evidence_store]},
+        semantic_validator=validate_adjudication)
+    state.final_result = FinalAnnotation(
+        execution_status="success", accepted_level=chosen.granularity,
+        resolution_audit=authoritative_report.resolution_audit, **decision.model_dump())
     return state
 
 
-def build_graph(*, client: JsonChatClient, model: str, temperature: float, retries: int, work_dir: Path | None = None):
-    """Compile the only V5.1 execution path."""
+def _trace(state: V5State) -> dict[str, Any]:
+    return {
+        "task": state.task.model_dump(),
+        "marker_audit": state.marker_audit.model_dump() if state.marker_audit else None,
+        "candidate_registry": state.candidate_registry.model_dump(),
+        "evidence_ledger": [item.model_dump() for item in state.evidence_store],
+        "verification_targets": [item.model_dump() for item in state.verification_targets],
+        "questions": [item.model_dump() for item in state.questions],
+        "messages": [item.model_dump() for item in state.messages],
+        "arguments": [item.model_dump() for item in state.arguments],
+        "verification_reports": [item.model_dump() for item in state.verification_reports],
+        "reference_comparisons": [item.model_dump() for item in state.reference_comparisons],
+        "verification_history": state.verification_history,
+        "transition_history": state.transition_history, "rounds": state.rounds,
+        "final_record": state.final_result.model_dump() if state.final_result else None,
+    }
+
+
+def build_graph(*, client: JsonChatClient, model: str, temperature: float, retries: int,
+                work_dir: Path | None = None):
     async def execute(values: dict[str, Any]) -> dict[str, Any]:
         state = V5State.model_validate(values["state"])
         try:
             completed = await _workflow(state, client=client, model=model, temperature=temperature,
                                         retries=retries, context=values["tool_context"])
         except Exception as error:
+            state.final_result = FinalAnnotation(execution_status="failed", annotation_status="failed",
+                                                  accepted_level="none", stop_reason=type(error).__name__)
             if work_dir:
                 work_dir.mkdir(parents=True, exist_ok=True)
-                failure = {
-                    "protocol_version": PROTOCOL_VERSION,
-                    "prompt_version": PROMPT_VERSION,
-                    "workflow_version": WORKFLOW_VERSION,
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                    "trace": _trace(state),
-                }
+                failure = {"protocol_version": PROTOCOL_VERSION, "prompt_version": PROMPT_VERSION,
+                           "workflow_version": WORKFLOW_VERSION, "error_type": type(error).__name__,
+                           "error": str(error), "trace": _trace(state)}
                 (work_dir / f"{state.task.cluster_id}.v5_failure.json").write_text(
-                    json.dumps(failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-                )
+                    json.dumps(failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             raise
         return {"state": completed.model_dump()}
-    graph = StateGraph(dict); graph.add_node("evidence_workflow", execute); graph.add_edge(START, "evidence_workflow"); graph.add_edge("evidence_workflow", END)
+    graph = StateGraph(dict)
+    graph.add_node("evidence_workflow", execute)
+    graph.add_edge(START, "evidence_workflow")
+    graph.add_edge("evidence_workflow", END)
     return graph.compile()
 
 
-def _trace(state: V5State) -> dict[str, Any]:
-    return {"task": state.task.model_dump(), "marker_audit": state.marker_audit.model_dump() if state.marker_audit else None, "candidate_registry": state.candidate_registry.model_dump(), "evidence_ledger": [v.model_dump() for v in state.evidence_store], "verification_targets": [v.model_dump() for v in state.verification_targets], "questions": [v.model_dump() for v in state.questions], "messages": [v.model_dump() for v in state.messages], "arguments": [v.model_dump() for v in state.arguments], "verification_reports": [v.model_dump() for v in state.verification_reports], "reference_comparisons": [v.model_dump() for v in state.reference_comparisons], "transition_history": state.transition_history, "rounds": state.rounds, "final_record": state.final_result.model_dump() if state.final_result else None}
-
-
-def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str, markers: list[str], client: JsonChatClient, model: str, temperature: float, retries: int, work_dir: Path | None = None, prompt_version: str = PROMPT_VERSION, protocol_version: str = PROTOCOL_VERSION, expression_file: str | Path | None = None, expression_manifest: str | Path | None = None, **kwargs: Any) -> dict[str, Any]:
-    marker_path, top_k = kwargs.pop("cellmarker_reference_path", ""), kwargs.pop("cellmarker_top_k", 5)
+def annotate_cluster(*, cluster_id: str, dataset: str, species: str, tissue: str,
+                     markers: list[str], client: JsonChatClient, model: str, temperature: float,
+                     retries: int, work_dir: Path | None = None, prompt_version: str = PROMPT_VERSION,
+                     protocol_version: str = PROTOCOL_VERSION, expression_file: str | Path | None = None,
+                     expression_manifest: str | Path | None = None, verifier_max_rounds: int = MAX_ROUNDS,
+                     **kwargs: Any) -> dict[str, Any]:
+    marker_path = kwargs.pop("cellmarker_reference_path", "")
+    top_k = kwargs.pop("cellmarker_top_k", 5)
     binding = kwargs.pop("comparison_reference_binding", None)
     reference_max = kwargs.pop("reference_max", 3)
-    if kwargs: raise TypeError(f"unexpected V5 parameters: {', '.join(sorted(kwargs))}")
-    if prompt_version != PROMPT_VERSION or protocol_version != PROTOCOL_VERSION: raise ValueError(f"CellClick V5 requires protocol_version=v5 and prompt_version={PROMPT_VERSION}")
-    if expression_file is None or expression_manifest is None: raise ValueError("CellClick V5 requires expression evidence")
-    if not marker_path: raise ValueError("CellClick V5 requires cellmarker_reference_path")
-    task = TaskInput(task_id=cluster_id, cluster_id=cluster_id, dataset=dataset, species=species, tissue=tissue, ordered_markers=markers)
-    expression = marker_expression_evidence(expression_file=expression_file, manifest_file=expression_manifest, source_row_id=cluster_id, genes=markers)
-    state = V5State(task=task, evidence_store=_initial_evidence(task, expression), budget={"tool_requests": 8, "revisions": 2})
-    trusted_labels: list[str] = []
+    if kwargs:
+        raise TypeError(f"unexpected V5 parameters: {', '.join(sorted(kwargs))}")
+    if type(verifier_max_rounds) is not int or not 1 <= verifier_max_rounds <= MAX_ROUNDS:
+        raise ValueError("verifier_max_rounds must be an integer between 1 and 6")
+    if prompt_version != PROMPT_VERSION or protocol_version != PROTOCOL_VERSION:
+        raise ValueError(f"CellClick V5 requires protocol_version=v5 and prompt_version={PROMPT_VERSION}")
+    if expression_file is None or expression_manifest is None:
+        raise ValueError("CellClick V5 requires expression evidence")
+    if not marker_path:
+        raise ValueError("CellClick V5 requires cellmarker_reference_path")
+    task = TaskInput(task_id=cluster_id, cluster_id=cluster_id, dataset=dataset, species=species,
+                     tissue=tissue, ordered_markers=markers)
+    expression = marker_expression_evidence(expression_file=expression_file, manifest_file=expression_manifest,
+                                             source_row_id=cluster_id, genes=markers)
+    state = V5State(task=task, evidence_store=_initial_evidence(task, expression))
     reference_packet: dict[str, Any] = {}
     try:
         from cellclick.reference import MarkerReferenceRetriever
         reference_packet = MarkerReferenceRetriever.from_tsv(Path(marker_path)).retrieve(
             markers, tissue, top_k=top_k).prompt_dict()
-        hits = reference_packet.get("hits", [])
-        trusted_labels = [str(hit.get("label", "")).strip() for hit in hits if isinstance(hit, dict) and hit.get("label")]
-    except Exception:
-        # Candidate generation remains available if reference retrieval is
-        # unavailable; the tool call later reports the capability limitation.
-        trusted_labels = []
+    except Exception as error:
+        state.verification_history.append({"role": "program", "stage": "initial_cellmarker",
+                                           "status": "failed", "error_type": type(error).__name__})
     reference_entry = _reference_evidence(task, reference_packet)
     if reference_entry is not None:
         state.evidence_store.append(reference_entry)
     comparison = binding.get("ref_path") if isinstance(binding, dict) else None
-    available_reference_labels: list[str] = []
     if comparison:
         try:
-            manifest_value = json.loads(Path(expression_manifest).read_text(encoding="utf-8"))
+            manifest = json.loads(Path(expression_manifest).read_text(encoding="utf-8"))
             configured_h5ad = Path(str(binding.get("h5ad_path", ""))).resolve()
-            source_h5ad = Path(str(manifest_value.get("source_h5ad_path", ""))).resolve()
+            source_h5ad = Path(str(manifest.get("source_h5ad_path", ""))).resolve()
             if not configured_h5ad.is_file() or configured_h5ad != source_h5ad:
-                comparison = None
                 raise LookupError("comparison_reference_source_h5ad_mismatch")
             loaded = json.loads(Path(comparison).read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                available_reference_labels = [str(label) for label in loaded if isinstance(label, str) and label.strip()]
-        except (OSError, json.JSONDecodeError, LookupError):
+            if not isinstance(loaded, dict) or not all(
+                    isinstance(label, str) and isinstance(genes, list)
+                    and all(isinstance(gene, str) for gene in genes) for label, genes in loaded.items()):
+                raise ValueError("comparison reference must map labels to gene lists")
+        except (OSError, ValueError, LookupError) as error:
+            state.verification_history.append({"role": "program", "stage": "reference_binding",
+                                               "status": "unavailable", "reason": str(error)})
             comparison = None
-    context = {"expression_file": str(Path(expression_file).resolve()), "expression_manifest": str(Path(expression_manifest).resolve()), "source_row_id": cluster_id, "tissue": tissue, "cellmarker_reference_path": marker_path, "cellmarker_top_k": top_k, "comparison_reference_path": comparison, "available_reference_labels": available_reference_labels, "query_markers": markers, "work_dir": str(work_dir or Path.cwd()), "trusted_major_labels": trusted_labels, "reference_candidates": reference_packet.get("hits", []), "reference_max": reference_max}
+    context = {
+        "expression_file": str(Path(expression_file).resolve()),
+        "expression_manifest": str(Path(expression_manifest).resolve()), "source_row_id": cluster_id,
+        "tissue": tissue, "cellmarker_reference_path": marker_path, "cellmarker_top_k": top_k,
+        "comparison_reference_path": comparison, "query_markers": markers,
+        "work_dir": str(work_dir or Path.cwd()), "reference_candidates": reference_packet.get("hits", []),
+        "reference_max": reference_max, "verifier_max_rounds": verifier_max_rounds,
+    }
+    for key in ("expression_file", "expression_manifest", "comparison_reference_path"):
+        if context.get(key):
+            context[key + "_sha256"] = _file_sha256(context[key])
     async def run():
-        try: return V5State.model_validate((await build_graph(client=client, model=model, temperature=temperature, retries=retries, work_dir=work_dir).ainvoke({"state": state.model_dump(), "tool_context": context}))["state"])
-        finally: await close_json_client(client)
+        try:
+            values = await build_graph(client=client, model=model, temperature=temperature,
+                                       retries=retries, work_dir=work_dir).ainvoke(
+                                           {"state": state.model_dump(), "tool_context": context})
+            return V5State.model_validate(values["state"])
+        finally:
+            await close_json_client(client)
     completed = asyncio.run(run())
     trace = _trace(completed)
     if work_dir:
-        work_dir.mkdir(parents=True, exist_ok=True); (work_dir / f"{cluster_id}.v5_trace.json").write_text(json.dumps(trace, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    final = trace["final_record"] or {}; final.update({"protocol_version": PROTOCOL_VERSION, "prompt_version": PROMPT_VERSION, "workflow_version": WORKFLOW_VERSION})
-    return {"status": final.get("annotation_status", "failed"), "round_count": sum(completed.rounds.values()),
-            "fallback": final.get("stop_reason") == "deterministic_reference_fallback",
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / f"{cluster_id}.v5_trace.json").write_text(
+            json.dumps(trace, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    final = trace["final_record"] or {}
+    final.update({"protocol_version": PROTOCOL_VERSION, "prompt_version": PROMPT_VERSION,
+                  "workflow_version": WORKFLOW_VERSION})
+    return {"status": final.get("verification_status", "failed"),
+            "round_count": sum(completed.rounds.values()), "rounds": completed.rounds,
             "final_record": final, "trace": trace}

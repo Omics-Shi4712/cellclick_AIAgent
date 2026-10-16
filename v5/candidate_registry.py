@@ -156,7 +156,7 @@ def map_label(label: str, *, mapping_path: Path = MAPPING_CACHE, embedding_path:
     elif gap < margin: status, clid = "ambiguous", None
     else: status, clid = "mapped", scored[0][1]
     canonical = next((item[2] for item in scored if item[1] == clid), "") if clid else ""
-    rows[key] = {"label_normalized": key, "label_original": label, "cl_id": clid or "", "mapping_status": status, "canonical_label": canonical, "score": f"{top:.6f}", "margin": f"{gap:.6f}", "model": "text-embedding-3-small", "policy_version": "cellclick-v5.6-embedding"}
+    rows[key] = {"label_normalized": key, "label_original": label, "cl_id": clid or "", "mapping_status": status, "canonical_label": canonical, "score": f"{top:.6f}", "margin": f"{gap:.6f}", "model": "text-embedding-3-small", "policy_version": "cellclick-v5.8-embedding"}
     _save_map(mapping_path, rows)
     return {"cl_id": clid, "mapping_status": status, "canonical_label": canonical, "score": top, "margin": gap}
 
@@ -195,3 +195,70 @@ def register_major(raw_candidates: Iterable[dict[str, Any]], *, version: int = 1
         proposals.append(CandidateProposal(candidate_id=f"H{i:02d}", label=item.get("canonical_label") or item["original_label"], granularity="major", provisional=True, source="MajorType", cl_id=item.get("cl_id"), mapping_status=item.get("mapping_status", "unmapped"), original_labels=item["original_labels"], provenance=item["provenance"]))
     ids = [x.candidate_id for x in proposals]
     return CandidateRegistry(version=version, candidates=proposals, parent_by_id={x: None for x in ids}, competing_by_id={x: [y for y in ids if y != x] for x in ids})
+
+
+def register_subtype(raw_candidates: Iterable[dict[str, Any]], *, parent: CandidateProposal,
+                     catalog: Iterable[dict[str, Any]], version: int = 2,
+                     max_candidates: int = 5, usable_evidence: set[str] | None = None) -> CandidateRegistry:
+    """Register directory-bound subtype proposals beneath ``parent``.
+
+    Structural validation belongs here so invalid model output cannot enter
+    the registry. Biological sufficiency remains the verifier's decision.
+    """
+    catalog_by_id = {
+        str(item.get("cl_id")): item for item in catalog
+        if isinstance(item, dict) and isinstance(item.get("cl_id"), str)
+    }
+    parent_cl_id = parent.cl_id
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in raw_candidates:
+        cl_id = _valid_cl(raw.get("cl_id"))
+        if not cl_id or cl_id == parent_cl_id or cl_id not in catalog_by_id:
+            continue
+        evidence_ids = list(dict.fromkeys(
+            item for item in raw.get("evidence_ids", [])
+            if isinstance(item, str) and item.strip()
+        ))
+        rationale = str(raw.get("rationale", "")).strip()
+        if not evidence_ids or not rationale:
+            continue
+        if usable_evidence is not None and not set(evidence_ids) <= usable_evidence:
+            continue
+        item = merged.setdefault(cl_id, {
+            "cl_id": cl_id,
+            "label": str(catalog_by_id[cl_id].get("label", cl_id)).strip() or cl_id,
+            "evidence_ids": [],
+            "rationale": [],
+        })
+        item["evidence_ids"] = list(dict.fromkeys(item["evidence_ids"] + evidence_ids))
+        if rationale not in item["rationale"]:
+            item["rationale"].append(rationale)
+
+    children = list(merged.values())[:max_candidates]
+    values = [parent]
+    for offset, item in enumerate(children, 20):
+        values.append(CandidateProposal(
+            candidate_id=f"H{offset:02d}",
+            label=item["label"],
+            granularity="subtype",
+            parent_id=parent.candidate_id,
+            provisional=True,
+            source="SubType",
+            cl_id=item["cl_id"],
+            mapping_status="mapped",
+            original_labels=[item["label"]],
+            provenance=[{
+                "source": "SubType",
+                "evidence_ids": item["evidence_ids"],
+                "rationale": " ".join(item["rationale"]),
+            }],
+        ))
+    ids = [item.candidate_id for item in values]
+    return CandidateRegistry(
+        version=version,
+        candidates=values,
+        parent_by_id={item.candidate_id: item.parent_id for item in values},
+        competing_by_id={item.candidate_id: [other for other in ids
+                                             if other not in {item.candidate_id, item.parent_id}]
+                         for item in values},
+    )

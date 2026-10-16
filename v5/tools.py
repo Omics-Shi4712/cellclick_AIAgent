@@ -7,15 +7,20 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .expression import gene_statistics, reference_expression_inputs
+from .expression import gene_cosine_statistics, gene_statistics, reference_expression_inputs
 from .models import ToolObservation, ToolRequest
 from .reference_comparison import compare_reference
 
 ToolHandler = Callable[[ToolRequest, dict[str, Any]], dict[str, Any]]
 
 
-def parameter_hash(request: ToolRequest) -> str:
-    value = {"tool_name": request.tool_name, "target_id": request.target_id, "arguments": request.arguments}
+def parameter_hash(request: ToolRequest, context: dict[str, Any] | None = None) -> str:
+    binding = context or {}
+    value = {"tool_name": request.tool_name, "target_id": request.target_id, "arguments": request.arguments,
+             "binding": {key: binding.get(key) for key in (
+                 "source_row_id", "expression_file", "expression_manifest", "expression_file_sha256",
+                 "expression_manifest_sha256", "comparison_reference_path_sha256")},
+             "statistics_layer": "normalization+log1p"}
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
@@ -32,7 +37,7 @@ class ToolRegistry:
         return tuple(sorted(self._handlers))
 
     def dispatch(self, request: ToolRequest, context: dict[str, Any]) -> ToolObservation:
-        digest = parameter_hash(request)
+        digest = parameter_hash(request, context)
         handler = self._handlers.get(request.tool_name)
         if handler is None:
             return ToolObservation(observation_id=f"OBS_{request.request_id}", request_id=request.request_id,
@@ -61,7 +66,7 @@ def _not_implemented(request: ToolRequest, context: dict[str, Any]) -> dict[str,
 
 
 DEFAULT_TOOLS = ToolRegistry()
-for _name in ("query_cellmarker", "query_expression", "compare_reference", "inspect_score_patterns"):
+for _name in ("query_expression", "gene_cosine", "compare_reference"):
     DEFAULT_TOOLS.register(_name, _not_implemented)
 
 
@@ -79,58 +84,81 @@ def build_tool_registry(context: dict[str, Any]) -> ToolRegistry:
         return gene_statistics(expression_file=context["expression_file"], manifest_file=context["expression_manifest"],
                                source_row_id=context["source_row_id"], genes=genes)
 
-    def cellmarker(request: ToolRequest, _: dict[str, Any]) -> dict[str, Any]:
-        from cellclick.reference import MarkerReferenceRetriever
-        genes = request.arguments.get("genes", [])
-        if not isinstance(genes, list) or not genes:
-            raise ValueError("query_cellmarker.arguments.genes must be a non-empty list")
-        retriever = MarkerReferenceRetriever.from_tsv(Path(context["cellmarker_reference_path"]))
-        return retriever.retrieve(genes, context["tissue"], top_k=int(context["cellmarker_top_k"])).prompt_dict()
+    def cosine(request: ToolRequest, _: dict[str, Any]) -> dict[str, Any]:
+        gene_sets = request.arguments.get("gene_sets")
+        compare_pairs = request.arguments.get("compare_pairs")
+        if not isinstance(gene_sets, list) or not isinstance(compare_pairs, list):
+            raise ValueError("gene_cosine requires gene_sets and compare_pairs lists")
+        return gene_cosine_statistics(
+            expression_file=context["expression_file"], manifest_file=context["expression_manifest"],
+            source_row_id=context["source_row_id"], gene_sets=gene_sets, compare_pairs=compare_pairs,
+        )
 
     def comparison(request: ToolRequest, _: dict[str, Any]) -> dict[str, Any]:
         reference_path = context.get("comparison_reference_path")
-        if not reference_path:
-            raise LookupError("reference_comparison_unavailable_for_tissue")
-        reference = json.loads(Path(reference_path).read_text(encoding="utf-8"))
+        reference = json.loads(Path(reference_path).read_text(encoding="utf-8")) if reference_path else {}
         if not isinstance(reference, dict) or not all(isinstance(k, str) and isinstance(v, list) for k, v in reference.items()):
             raise ValueError("ReferenceComparison JSON must map cell-type strings to marker lists")
-        labels = request.arguments.get("labels")
-        if not isinstance(labels, list) or not labels:
-            raise ValueError("compare_reference.arguments.labels must contain at least one label")
-        if len(labels) != len(set(labels)) or any(label not in reference for label in labels):
-            raise ValueError("compare_reference labels must exactly match available reference labels")
+        marker_sets = request.arguments.get("marker_sets")
+        if not isinstance(marker_sets, list) or len(marker_sets) != 1:
+            raise ValueError("compare_reference requires exactly one marker set")
+        marker_set = marker_sets[0]
+        candidate_id = str(marker_set.get("candidate_id", "")).strip()
         allowed = set(context.get("allowed_candidate_ids", ()))
-        if not set(request.hypothesis_ids) <= allowed or not request.hypothesis_ids:
-            raise ValueError("compare_reference hypothesis_ids must belong to the current candidates")
-        chosen = {label: reference[label] for label in labels}
+        if candidate_id not in allowed or request.hypothesis_ids != [candidate_id]:
+            raise ValueError("compare_reference candidate must be the current validation candidate")
+        source = marker_set.get("source")
+        reference_label = marker_set.get("reference_label")
+        requested_genes = list(dict.fromkeys(str(g).strip() for g in marker_set.get("genes", []) if str(g).strip()))
+        if not requested_genes:
+            raise ValueError("compare_reference marker set requires genes")
+        if source == "reference":
+            if reference_label not in reference:
+                raise ValueError("reference_label must exactly match an available reference")
+            allowed_genes = list(dict.fromkeys(str(g).strip() for g in reference[reference_label] if str(g).strip()))
+            if not set(requested_genes) <= set(allowed_genes):
+                raise ValueError("reference marker genes must come from the selected reference")
+            reference_genes = requested_genes
+            reference_version_source = {"path": str(Path(reference_path).resolve()), "label": reference_label,
+                                        "genes": reference[reference_label]}
+        elif source == "llm":
+            if reference_label is not None:
+                raise ValueError("source=llm must not claim a reference label")
+            reference_genes = requested_genes
+            reference_version_source = {"source": "llm", "candidate_id": candidate_id}
+        else:
+            raise ValueError("marker set source must be reference or llm")
         query_markers = context.get("query_markers", [])
         if not query_markers:
             raise ValueError("query markers are unavailable for reference comparison")
-        genes = list(dict.fromkeys([*query_markers, *(gene for markers in chosen.values() for gene in markers)]))
+        genes = list(dict.fromkeys([*query_markers, *reference_genes]))
         vectors = reference_expression_inputs(expression_file=context["expression_file"], manifest_file=context["expression_manifest"],
                                               source_row_id=context["source_row_id"], genes=genes)
-        cosg = {}
+        specificity = {}
         target_index = vectors["groups"].index(vectors["target_group"])
-        for gene in query_markers:
+        for gene in genes:
             values = vectors["query_means"].get(gene)
             if values:
                 rest = [value for i, value in enumerate(values) if i != target_index]
-                cosg[gene] = max(0.0, float(values[target_index] - (sum(rest) / len(rest) if rest else 0.0)))
-        scores, coverage, decompositions, valid_markers, cell_scores = {}, {}, {}, {}, {}
-        for label, markers in chosen.items():
-            result = compare_reference(query_markers=query_markers, reference_markers=markers,
+                specificity[gene] = max(0.0, float(values[target_index] - (sum(rest) / len(rest) if rest else 0.0)))
+        result = compare_reference(query_markers=query_markers, reference_markers=reference_genes,
                 query_vectors=vectors["query_vectors"], reference_vectors=vectors["query_vectors"],
                 query_means=vectors["query_means"], reference_means=vectors["query_means"],
-                cosg_scores=cosg, cell_expression=vectors["cell_expression"])
-            scores[label] = float(sum(result["scores"].values()) / len(result["scores"])) if result["scores"] else 0.0
-            cell_scores[label] = result.get("scores", {})
-            coverage[label] = float(result["coverage"])
-            valid_markers[label] = result["valid_markers"]
-            decompositions[label] = {key: result[key] for key in ("GS", "RES", "EAD")}
-        digest = hashlib.sha256(json.dumps({"path": str(Path(reference_path).resolve()), "labels": labels,
-                                             "query_markers": query_markers}, sort_keys=True).encode()).hexdigest()
+                cosg_scores=specificity, cell_expression=vectors["cell_expression"])
+        label = reference_label or candidate_id
+        scores = {label: float(sum(result["scores"].values()) / len(result["scores"])) if result["scores"] else 0.0}
+        coverage = {label: float(result["coverage"])}
+        valid_markers = {label: result["valid_markers"]}
+        decompositions = {label: {key: result[key] for key in ("GS", "RES", "EAD")}}
+        reference_version = hashlib.sha256(json.dumps(reference_version_source, sort_keys=True).encode()).hexdigest()
+        digest = hashlib.sha256(json.dumps({"reference": reference_version_source,
+                                             "source_row_id": context["source_row_id"],
+                                             "expression_file_sha256": context.get("expression_file_sha256"),
+                                             "genes": reference_genes, "query_markers": query_markers},
+                                            sort_keys=True).encode()).hexdigest()
         comparison_id = "RC_" + digest[:20]
-        artifact = {"comparison_id": comparison_id, "labels": labels, "scores": scores,
+        cell_scores = {label: result.get("scores", {})}
+        artifact = {"comparison_id": comparison_id, "labels": [label], "scores": scores,
                     "cell_scores": cell_scores}
         work_dir = context.get("work_dir")
         if work_dir:
@@ -140,35 +168,32 @@ def build_tool_registry(context: dict[str, Any]) -> ToolRegistry:
                                         "coverage": coverage, "valid_markers": valid_markers,
                                         "decompositions": decompositions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             artifact["artifact_path"] = str(path)
-        return {"comparison_id": comparison_id, "candidate_ids": list(request.hypothesis_ids), "labels": labels,
-                "reference_path": str(Path(reference_path).resolve()), "reference_version": digest,
+        ead_values = result["EAD"]
+        ead_summary = {gene: {"mean": sum(values[gene] for values in ead_values.values()) / len(ead_values),
+                              "min": min(values[gene] for values in ead_values.values()),
+                              "max": max(values[gene] for values in ead_values.values())}
+                       for gene in result["valid_markers"]} if ead_values else {}
+        summarized = {label: {"GS": result["GS"], "RES": result["RES"], "EAD": ead_summary}}
+        cell_values = list(result["scores"].values())
+        return {"comparison_id": comparison_id, "candidate_ids": [candidate_id], "labels": [label],
+                "gene_source": source, "reference_label": reference_label,
+                "reference_path": str(Path(reference_path).resolve()) if reference_path else None,
+                "reference_version": reference_version,
+                "artifact_path": artifact.get("artifact_path"),
                 "score_matrix_handle": comparison_id, "scores": scores, "coverage": coverage,
-                "valid_markers": valid_markers, "decompositions": decompositions,
-                "calculation_mode": "query_expression_all_cells_v2",
-                "limitations": ["missing_genes:" + ",".join(vectors["missing_genes"])] if vectors["missing_genes"] else []}
-
-    def patterns(request: ToolRequest, _: dict[str, Any]) -> dict[str, Any]:
-        comparison_id = request.arguments.get("comparison_id")
-        if not isinstance(comparison_id, str) or not comparison_id.strip():
-            raise ValueError("inspect_score_patterns.arguments.comparison_id is required")
-        allowed_comparisons = set(context.get("comparison_ids", ()))
-        if comparison_id not in allowed_comparisons:
-            raise LookupError("comparison_id_not_available_for_target")
-        path = Path(context.get("work_dir", ".")) / f"{comparison_id}.json"
-        if not path.is_file():
-            raise LookupError("comparison_id_not_found")
-        scores = json.loads(path.read_text(encoding="utf-8")).get("scores", {})
-        if not isinstance(scores, dict) or not scores:
-            raise LookupError("comparison_has_no_scores")
-        ranked = sorted(((str(label), float(score)) for label, score in scores.items()), key=lambda item: (-item[1], item[0]))
-        return {"ranked_labels": [{"label": label, "score": score} for label, score in ranked],
-                "top_score_gap": round(ranked[0][1] - ranked[1][1], 6) if len(ranked) > 1 else None,
-                "mixture_suspected": len(ranked) > 1 and ranked[0][1] > 0 and ranked[1][1] / ranked[0][1] >= 0.8}
+                "valid_markers": valid_markers, "missing_genes": vectors["missing_genes"],
+                "query_marker_overlap": sorted(set(query_markers) & set(reference_genes)),
+                "decompositions": summarized,
+                "cell_score_summary": {"count": len(cell_values),
+                                       "mean": scores[label],
+                                       "min": min(cell_values) if cell_values else None,
+                                       "max": max(cell_values) if cell_values else None},
+                "cell_count": vectors["cell_count"], "statistics_layer": "normalization+log1p",
+                "calculation_mode": "query_expression_all_cells_v3",
+                "limitations": (["llm_marker_set_is_not_independent_reference"] if source == "llm" else [])
+                                + (["missing_genes:" + ",".join(vectors["missing_genes"])] if vectors["missing_genes"] else [])}
 
     registry.register("query_expression", expression)
-    registry.register("query_cellmarker", cellmarker)
-    if context.get("comparison_reference_path"):
-        registry.register("compare_reference", comparison)
-        if context.get("allow_score_patterns", False):
-            registry.register("inspect_score_patterns", patterns)
+    registry.register("gene_cosine", cosine)
+    registry.register("compare_reference", comparison)
     return registry

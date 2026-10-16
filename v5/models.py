@@ -121,7 +121,7 @@ class ToolRequest(BaseModel):
     request_id: str = Field(min_length=1)
     task_id: str = Field(min_length=1)
     question_id: str = Field(min_length=1)
-    tool_name: Literal["query_cellmarker", "query_expression", "compare_reference", "inspect_score_patterns"]
+    tool_name: Literal["query_expression", "gene_cosine", "compare_reference"]
     target_id: str = Field(min_length=1)
     hypothesis_ids: list[str] = Field(default_factory=list)
     argument_id: str | None = None
@@ -168,13 +168,15 @@ class VerificationReport(BaseModel):
     report_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
     scope: Literal["major", "subtype"]
-    candidate_status: dict[str, Literal["supported", "uncertain", "conflicted", "insufficient_evidence"]]
+    verification_status: Literal["solved", "resolved"]
+    selected_candidate_id: str = Field(min_length=1)
+    last_active_state: Literal["multiple", "mixture_cell", "validation"]
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     conflicting_evidence_ids: list[str] = Field(default_factory=list)
-    composition: dict[str, Any] | None = None
-    revision_requests: list[dict[str, Any]] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
+    remaining_limitations: list[str] = Field(default_factory=list)
     stop_reason: str = Field(min_length=1)
+    resolution_audit: ResolutionAudit | None = None
 
 
 class ReferenceComparisonResult(BaseModel):
@@ -192,34 +194,36 @@ class ReferenceComparisonResult(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
 
-class FallbackAudit(BaseModel):
+class ResolutionAudit(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source_evidence_id: str = Field(min_length=1)
-    candidate_id: str = Field(min_length=1)
-    top_score: float
-    second_score: float
-    score_gap: float
+    last_active_state: Literal["multiple", "mixture_cell", "validation"]
+    trigger: Literal["max_rounds_reached", "no_executable_query"]
+    selected_candidate_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+    remaining_limitations: list[str] = Field(default_factory=list)
 
 
 class FinalAnnotation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     execution_status: Literal["success", "failed"]
-    annotation_status: Literal["accepted", "major_accepted_subtype_unresolved", "unresolved", "mixture", "failed"]
+    annotation_status: Literal["accepted", "major_accepted_subtype_unresolved", "failed"]
     identity: str | None = None
     subtype: str | None = None
-    accepted_level: Literal["major", "subtype", "composition", "none"]
+    accepted_level: Literal["major", "subtype", "none"]
+    selected_candidate_id: str | None = None
+    verification_status: Literal["solved", "resolved"] | None = None
+    verification_report_id: str | None = None
     cluster_summary: str = ""
-    population_annotations: list[dict[str, Any]] = Field(default_factory=list)
-    doublet_suspect_cell_sets: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     accepted_argument_ids: list[str] = Field(default_factory=list)
-    fallback_audit: FallbackAudit | None = None
+    resolution_audit: ResolutionAudit | None = None
     stop_reason: str = Field(min_length=1)
 
 
 class MessageEnvelope(BaseModel):
-    schema_version: Literal["cellclick.v5.message.1"] = "cellclick.v5.message.1"
+    schema_version: Literal["cellclick.v5.message.2"] = "cellclick.v5.message.2"
     message_id: str = Field(min_length=1)
     reply_to: str | None = None
     task_id: str = Field(min_length=1)
@@ -243,7 +247,7 @@ class V5State(BaseModel):
     reference_comparisons: list[ReferenceComparisonResult] = Field(default_factory=list)
     arguments: list[ToulminArgument] = Field(default_factory=list)
     questions: list[VerificationQuestion] = Field(default_factory=list)
-    budget: dict[str, int] = Field(default_factory=lambda: {"tool_requests": 8, "revisions": 2})
+    verification_history: list[dict[str, Any]] = Field(default_factory=list)
     transition_history: list[dict[str, Any]] = Field(default_factory=list)
     messages: list[MessageEnvelope] = Field(default_factory=list)
     rounds: dict[str, int] = Field(default_factory=lambda: {"major": 0, "subtype": 0})
@@ -263,6 +267,20 @@ class CandidateDraft(BaseModel):
 class CandidateDraftResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     candidates: list[CandidateDraft] = Field(min_length=1, max_length=5)
+
+
+class SubtypeCandidate(BaseModel):
+    """A directory-bound subtype proposal."""
+    model_config = ConfigDict(extra="forbid")
+    cl_id: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class SubtypeCandidateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidates: list[SubtypeCandidate] = Field(default_factory=list, max_length=5)
+    limitations: list[str] = Field(default_factory=list)
 
 
 class MarkerInterpretation(BaseModel):
@@ -320,83 +338,66 @@ class ToolScore(BaseModel):
     score: float
 
 
-class ToolArguments(BaseModel):
-    """Union of the bounded argument shapes supported by V5 tools."""
-    model_config = ConfigDict(extra="forbid")
-    genes: list[str] = Field(default_factory=list)
-    labels: list[str] = Field(default_factory=list)
-    comparison_id: str = ""
-
-
-class ToolRequestDraft(BaseModel):
-    """LLM-facing tool request; protocol handles are assigned by the program."""
-    model_config = ConfigDict(extra="forbid")
-    tool_name: Literal["query_cellmarker", "query_expression", "compare_reference", "inspect_score_patterns"]
-    hypothesis_ids: list[str] = Field(default_factory=list)
-    purpose: str = Field(min_length=1)
-    discriminating_question: str = Field(min_length=1)
-    arguments: ToolArguments = Field(default_factory=ToolArguments)
-
-    @model_validator(mode="after")
-    def valid_arguments(self) -> "ToolRequestDraft":
-        args = self.arguments
-        if self.tool_name in {"query_cellmarker", "query_expression"}:
-            if not args.genes or args.labels or args.comparison_id:
-                raise ValueError(f"{self.tool_name} requires only non-empty genes")
-        elif self.tool_name == "compare_reference":
-            if not args.labels or args.genes or args.comparison_id:
-                raise ValueError("compare_reference requires only non-empty labels")
-        elif self.tool_name == "inspect_score_patterns":
-            if not args.comparison_id or args.genes or args.labels:
-                raise ValueError("inspect_score_patterns requires only comparison_id")
-        return self
-
-
-class CandidateStatus(BaseModel):
+class GeneSetDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     candidate_id: str = Field(min_length=1)
-    status: Literal["supported", "uncertain", "conflicted", "insufficient_evidence"]
+    genes: list[str] = Field(default_factory=list)
+
+
+class ComparePairDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    left_candidate_id: str = Field(min_length=1)
+    right_candidate_id: str = Field(min_length=1)
+
+
+class MarkerSetDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: str = Field(min_length=1)
+    source: Literal["reference", "llm"]
+    reference_label: str | None = None
+    genes: list[str] = Field(default_factory=list)
+
+
+class QueryBuilderResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    genes: list[str] = Field(default_factory=list)
+    question: str = ""
+    gene_sets: list[GeneSetDraft] = Field(default_factory=list)
+    compare_pairs: list[ComparePairDraft] = Field(default_factory=list)
+    marker_sets: list[MarkerSetDraft] = Field(default_factory=list)
+    rationale: str = Field(min_length=1)
+    no_query_reason: str | None = None
 
 
 class VerifierResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: Literal["request_tools", "revise", "advance_subtype", "accept_major", "accept_subtype", "mixture", "unresolved"]
-    candidate_status: list[CandidateStatus]
-    supporting_evidence_ids: list[str] = Field(default_factory=list)
-    conflicting_evidence_ids: list[str] = Field(default_factory=list)
+    next_state: Literal["multiple", "mixture_cell", "validation", "solved", "unresolved"]
+    reason: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
-    tool_requests: list[ToolRequestDraft] = Field(default_factory=list)
-    revision_requests: list[str] = Field(default_factory=list)
-    stop_reason: str = Field(min_length=1)
+    candidate_id: str | None = None
+    validation_passed: bool | None = None
+    remaining_limitations: list[str] = Field(default_factory=list)
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_candidate_status(cls, value: Any) -> Any:
-        if isinstance(value, dict) and isinstance(value.get("candidate_status"), dict):
-            value = dict(value)
-            value["candidate_status"] = [
-                {"candidate_id": key, "status": status}
-                for key, status in value["candidate_status"].items()
-            ]
-        return value
+
+class ResolutionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selected_candidate_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+    remaining_limitations: list[str] = Field(default_factory=list)
 
 
 class AdjudicationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    annotation_status: Literal["accepted", "major_accepted_subtype_unresolved", "unresolved", "mixture"]
+    annotation_status: Literal["accepted", "major_accepted_subtype_unresolved"]
     identity: str | None = None
     subtype: str | None = None
+    selected_candidate_id: str = Field(min_length=1)
+    verification_status: Literal["solved", "resolved"]
+    verification_report_id: str = Field(min_length=1)
     cluster_summary: str = ""
-    population_annotations: list["PopulationAnnotation"] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     accepted_argument_ids: list[str] = Field(default_factory=list)
     stop_reason: str = Field(min_length=1)
-
-
-class PopulationAnnotation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    label: str = Field(min_length=1)
-    fraction: float | None = Field(default=None, ge=0.0, le=1.0)
-    evidence_ids: list[str] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
