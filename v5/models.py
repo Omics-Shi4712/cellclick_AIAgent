@@ -52,6 +52,10 @@ class CandidateProposal(BaseModel):
     competing_candidate_ids: list[str] = Field(default_factory=list)
     argument_ids: list[str] = Field(default_factory=list)
     source: Literal["MajorType", "SubType", "revision"]
+    cl_id: str | None = None
+    mapping_status: str = "unmapped"
+    original_labels: list[str] = Field(default_factory=list)
+    provenance: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CandidateRegistry(BaseModel):
@@ -176,6 +180,8 @@ class VerificationReport(BaseModel):
 class ReferenceComparisonResult(BaseModel):
     comparison_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)
+    candidate_ids: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
     reference_version: str = Field(min_length=1)
     calculation_mode: str = Field(min_length=1)
     score_matrix_handle: str = Field(min_length=1)
@@ -259,6 +265,35 @@ class CandidateDraftResponse(BaseModel):
     candidates: list[CandidateDraft] = Field(min_length=1, max_length=5)
 
 
+class MarkerInterpretation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gene: str = Field(min_length=1)
+    primary_role: Literal["lineage", "function", "low_information"]
+    association: str = Field(min_length=1)
+
+
+class MajorReferenceCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reference_rank: int = Field(ge=1)
+    label: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+    rationale: str = Field(min_length=1)
+
+
+class MajorMarkerCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+    rationale: str = Field(min_length=1)
+
+
+class MajorCandidateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    marker_interpretations: list[MarkerInterpretation] = Field(default_factory=list)
+    selected_reference_candidates: list[MajorReferenceCandidate] = Field(default_factory=list, max_length=5)
+    marker_based_candidates: list[MajorMarkerCandidate] = Field(default_factory=list, max_length=5)
+
+
 class ArgumentDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     hypothesis_id: str = Field(min_length=1)
@@ -290,8 +325,7 @@ class ToolArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
     genes: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
-    query_markers: list[str] = Field(default_factory=list)
-    scores: list[ToolScore] = Field(default_factory=list)
+    comparison_id: str = ""
 
 
 class ToolRequestDraft(BaseModel):
@@ -302,6 +336,20 @@ class ToolRequestDraft(BaseModel):
     purpose: str = Field(min_length=1)
     discriminating_question: str = Field(min_length=1)
     arguments: ToolArguments = Field(default_factory=ToolArguments)
+
+    @model_validator(mode="after")
+    def valid_arguments(self) -> "ToolRequestDraft":
+        args = self.arguments
+        if self.tool_name in {"query_cellmarker", "query_expression"}:
+            if not args.genes or args.labels or args.comparison_id:
+                raise ValueError(f"{self.tool_name} requires only non-empty genes")
+        elif self.tool_name == "compare_reference":
+            if not args.labels or args.genes or args.comparison_id:
+                raise ValueError("compare_reference requires only non-empty labels")
+        elif self.tool_name == "inspect_score_patterns":
+            if not args.comparison_id or args.genes or args.labels:
+                raise ValueError("inspect_score_patterns requires only comparison_id")
+        return self
 
 
 class CandidateStatus(BaseModel):

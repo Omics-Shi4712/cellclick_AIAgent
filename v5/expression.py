@@ -176,3 +176,65 @@ def gene_statistics(*, expression_file: str | Path, manifest_file: str | Path,
                 "cell_count": int(target.sum()), "background_cell_count": int((~target).sum()), "genes": rows}
     finally:
         del adata
+
+
+def reference_expression_inputs(*, expression_file: str | Path, manifest_file: str | Path,
+                                source_row_id: str, genes: Iterable[str]) -> dict[str, Any]:
+    """Read real all-cell/cluster vectors from the anonymous V5 export.
+
+    The export contains only normalized expression and anonymous group IDs, so
+    this remains label-free while providing the vectors required by GS/RES/EAD.
+    """
+    requested = list(dict.fromkeys(str(g).strip() for g in genes if str(g).strip()))
+    if not requested:
+        raise ValueError("reference_expression_inputs requires at least one gene")
+    expression_path = Path(expression_file).resolve()
+    manifest = json.loads(Path(manifest_file).read_text(encoding="utf-8"))
+    if manifest.get("h5ad_path") != str(expression_path):
+        raise ValueError("expression manifest does not bind to supplied export")
+    groups = sorted(str(group) for group, row in manifest.get("source_row_id_by_group", {}).items()
+                    if row == source_row_id)
+    if len(groups) != 1:
+        raise ValueError("reference expression target binding is invalid")
+    try:
+        import anndata as ad
+        import numpy as np
+        from scipy import sparse
+    except (ImportError, ValueError) as error:
+        raise RuntimeError("reference expression requires anndata, numpy, and scipy") from error
+    adata = ad.read_h5ad(expression_path)
+    try:
+        layer = manifest.get("statistics_layer")
+        if layer not in adata.layers or "cellclick_group_id" not in adata.obs:
+            raise ValueError("expression export lacks reference comparison layer/group")
+        index = {str(g): i for i, g in enumerate(adata.var_names.astype(str))}
+        labels = adata.obs["cellclick_group_id"].astype(str).to_numpy()
+        matrix = adata.layers[layer]
+        all_groups = sorted(set(labels))
+        target_mask = labels == groups[0]
+        if not target_mask.any() or target_mask.all() or len(all_groups) < 2:
+            raise ValueError("reference comparison requires target and background groups")
+        vectors: dict[str, list[float]] = {}
+        means: dict[str, list[float]] = {}
+        cell_expression: dict[str, dict[str, float]] = {}
+        missing: list[str] = []
+        for gene in requested:
+            pos = index.get(gene)
+            if pos is None:
+                missing.append(gene)
+                continue
+            values = matrix[:, pos]
+            values = values.toarray().ravel() if sparse.issparse(values) else np.asarray(values).ravel()
+            vectors[gene] = [float(x) for x in values]
+            means[gene] = [float(values[labels == group].mean()) for group in all_groups]
+            cell_expression[gene] = {f"cell_{i:09d}": float(value)
+                                     for i, value in enumerate(values[target_mask])}
+        target_cell_ids = [f"cell_{i:09d}" for i in range(int(target_mask.sum()))]
+        by_cell = {cell: {gene: cell_expression[gene][cell] for gene in vectors}
+                   for cell in target_cell_ids}
+        return {"query_vectors": vectors, "query_means": means,
+                "cell_expression": by_cell, "groups": all_groups,
+                "target_group": groups[0], "missing_genes": missing,
+                "available_genes": sorted(vectors), "cell_count": len(target_cell_ids)}
+    finally:
+        del adata

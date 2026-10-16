@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .expression import gene_statistics
+from .expression import gene_statistics, reference_expression_inputs
 from .models import ToolObservation, ToolRequest
 from .reference_comparison import compare_reference
 
@@ -95,43 +95,71 @@ def build_tool_registry(context: dict[str, Any]) -> ToolRegistry:
         if not isinstance(reference, dict) or not all(isinstance(k, str) and isinstance(v, list) for k, v in reference.items()):
             raise ValueError("ReferenceComparison JSON must map cell-type strings to marker lists")
         labels = request.arguments.get("labels")
-        chosen = {label: reference[label] for label in labels if label in reference} if isinstance(labels, list) else reference
-        query_markers = request.arguments.get("query_markers", [])
-        if not isinstance(query_markers, list) or not query_markers:
-            raise ValueError("compare_reference.arguments.query_markers must be a non-empty list")
+        if not isinstance(labels, list) or not labels:
+            raise ValueError("compare_reference.arguments.labels must contain at least one label")
+        if len(labels) != len(set(labels)) or any(label not in reference for label in labels):
+            raise ValueError("compare_reference labels must exactly match available reference labels")
+        allowed = set(context.get("allowed_candidate_ids", ()))
+        if not set(request.hypothesis_ids) <= allowed or not request.hypothesis_ids:
+            raise ValueError("compare_reference hypothesis_ids must belong to the current candidates")
+        chosen = {label: reference[label] for label in labels}
+        query_markers = context.get("query_markers", [])
+        if not query_markers:
+            raise ValueError("query markers are unavailable for reference comparison")
         genes = list(dict.fromkeys([*query_markers, *(gene for markers in chosen.values() for gene in markers)]))
-        stats = gene_statistics(expression_file=context["expression_file"], manifest_file=context["expression_manifest"],
-                                source_row_id=context["source_row_id"], genes=genes)
-        by_gene = {row["gene"]: row for row in stats["genes"] if row.get("available")}
-        # The export exposes target/background group statistics, not a labeled
-        # reference expression matrix.  Use the trusted target vector as the
-        # projection cell and surface absent reference vectors as limitations.
-        expression = {gene: float(row["mean_log1p"]) for gene, row in by_gene.items()}
-        cosg = {gene: max(0.0, float(row["mean_difference"])) for gene, row in by_gene.items()}
-        scores, coverage, decompositions, valid_markers = {}, {}, {}, {}
+        vectors = reference_expression_inputs(expression_file=context["expression_file"], manifest_file=context["expression_manifest"],
+                                              source_row_id=context["source_row_id"], genes=genes)
+        cosg = {}
+        target_index = vectors["groups"].index(vectors["target_group"])
+        for gene in query_markers:
+            values = vectors["query_means"].get(gene)
+            if values:
+                rest = [value for i, value in enumerate(values) if i != target_index]
+                cosg[gene] = max(0.0, float(values[target_index] - (sum(rest) / len(rest) if rest else 0.0)))
+        scores, coverage, decompositions, valid_markers, cell_scores = {}, {}, {}, {}, {}
         for label, markers in chosen.items():
-            result = compare_reference(query_markers=query_markers, reference_markers=markers, query_vectors={}, reference_vectors={},
-                query_means={}, reference_means={}, cosg_scores=cosg, cell_expression={"target": expression})
-            scores[label] = float(result["scores"].get("target", 0.0))
+            result = compare_reference(query_markers=query_markers, reference_markers=markers,
+                query_vectors=vectors["query_vectors"], reference_vectors=vectors["query_vectors"],
+                query_means=vectors["query_means"], reference_means=vectors["query_means"],
+                cosg_scores=cosg, cell_expression=vectors["cell_expression"])
+            scores[label] = float(sum(result["scores"].values()) / len(result["scores"])) if result["scores"] else 0.0
+            cell_scores[label] = result.get("scores", {})
             coverage[label] = float(result["coverage"])
             valid_markers[label] = result["valid_markers"]
             decompositions[label] = {key: result[key] for key in ("GS", "RES", "EAD")}
-        digest = hashlib.sha256(json.dumps({"path": str(Path(reference_path).resolve()), "labels": sorted(chosen)}, sort_keys=True).encode()).hexdigest()
-        return {"reference_path": str(Path(reference_path).resolve()), "reference_version": digest,
-                "score_matrix_handle": "RC_" + digest[:20], "scores": scores, "coverage": coverage,
+        digest = hashlib.sha256(json.dumps({"path": str(Path(reference_path).resolve()), "labels": labels,
+                                             "query_markers": query_markers}, sort_keys=True).encode()).hexdigest()
+        comparison_id = "RC_" + digest[:20]
+        artifact = {"comparison_id": comparison_id, "labels": labels, "scores": scores,
+                    "cell_scores": cell_scores}
+        work_dir = context.get("work_dir")
+        if work_dir:
+            path = Path(work_dir) / f"{comparison_id}.json"
+            path.write_text(json.dumps({"comparison_id": comparison_id, "scores": scores,
+                                        "cell_scores": cell_scores,
+                                        "coverage": coverage, "valid_markers": valid_markers,
+                                        "decompositions": decompositions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            artifact["artifact_path"] = str(path)
+        return {"comparison_id": comparison_id, "candidate_ids": list(request.hypothesis_ids), "labels": labels,
+                "reference_path": str(Path(reference_path).resolve()), "reference_version": digest,
+                "score_matrix_handle": comparison_id, "scores": scores, "coverage": coverage,
                 "valid_markers": valid_markers, "decompositions": decompositions,
-                "calculation_mode": "query_expression_projection_v1",
-                "limitations": ["reference_expression_vectors_unavailable; target_expression_projection_used"]}
+                "calculation_mode": "query_expression_all_cells_v2",
+                "limitations": ["missing_genes:" + ",".join(vectors["missing_genes"])] if vectors["missing_genes"] else []}
 
     def patterns(request: ToolRequest, _: dict[str, Any]) -> dict[str, Any]:
-        scores = request.arguments.get("scores")
-        if isinstance(scores, list):
-            scores = {
-                item.get("label"): item.get("score")
-                for item in scores if isinstance(item, dict) and item.get("label")
-            }
+        comparison_id = request.arguments.get("comparison_id")
+        if not isinstance(comparison_id, str) or not comparison_id.strip():
+            raise ValueError("inspect_score_patterns.arguments.comparison_id is required")
+        allowed_comparisons = set(context.get("comparison_ids", ()))
+        if comparison_id not in allowed_comparisons:
+            raise LookupError("comparison_id_not_available_for_target")
+        path = Path(context.get("work_dir", ".")) / f"{comparison_id}.json"
+        if not path.is_file():
+            raise LookupError("comparison_id_not_found")
+        scores = json.loads(path.read_text(encoding="utf-8")).get("scores", {})
         if not isinstance(scores, dict) or not scores:
-            raise ValueError("inspect_score_patterns.arguments.scores must be a non-empty mapping")
+            raise LookupError("comparison_has_no_scores")
         ranked = sorted(((str(label), float(score)) for label, score in scores.items()), key=lambda item: (-item[1], item[0]))
         return {"ranked_labels": [{"label": label, "score": score} for label, score in ranked],
                 "top_score_gap": round(ranked[0][1] - ranked[1][1], 6) if len(ranked) > 1 else None,
@@ -139,6 +167,8 @@ def build_tool_registry(context: dict[str, Any]) -> ToolRegistry:
 
     registry.register("query_expression", expression)
     registry.register("query_cellmarker", cellmarker)
-    registry.register("compare_reference", comparison)
-    registry.register("inspect_score_patterns", patterns)
+    if context.get("comparison_reference_path"):
+        registry.register("compare_reference", comparison)
+        if context.get("allow_score_patterns", False):
+            registry.register("inspect_score_patterns", patterns)
     return registry

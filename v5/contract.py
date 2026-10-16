@@ -15,6 +15,7 @@ def payload() -> dict[str, object]:
     return {"protocol": PROTOCOL_VERSION, "prompt": PROMPT_VERSION, "request_builder": REQUEST_BUILDER_VERSION,
             "workflow": WORKFLOW_VERSION, "candidates": ANNOTATION_CANDIDATES, "rounds": MAX_ROUNDS,
             "retries": REQUEST_RETRIES, "parallel": MAX_PARALLEL_CLUSTERS,
+            "reference_max_default": 3,
             "response_schemas": [m.model_json_schema() for m in (TaskInput, CandidateProposal, ToulminArgument,
                                                                     ToolRequest, ToolObservation, MessageEnvelope,
                                                                     FinalAnnotation, V5State)],
