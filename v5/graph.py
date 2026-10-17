@@ -25,7 +25,7 @@ from .candidate_registry import register_major, register_subtype
 
 PROTOCOL_VERSION = "v5"
 ANNOTATION_CANDIDATES, MAX_ROUNDS, REQUEST_RETRIES, MAX_PARALLEL_CLUSTERS = 5, 6, 2, 2
-WORKFLOW_VERSION = "v5.9-deduplicated-llm-context-cosine-summary"
+WORKFLOW_VERSION = "v5.9-deduplicated-llm-context-cosine-summary-verifier-resolution"
 
 
 @lru_cache(maxsize=16)

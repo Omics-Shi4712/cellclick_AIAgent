@@ -197,11 +197,14 @@ class ReferenceComparisonResult(BaseModel):
 class ResolutionAudit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     last_active_state: Literal["multiple", "mixture_cell", "validation"]
-    trigger: Literal["max_rounds_reached", "no_executable_query"]
+    trigger: Literal["max_rounds_reached", "no_executable_query", "verifier_protocol_error"]
     selected_candidate_id: str = Field(min_length=1)
     reason: str = Field(min_length=1)
     evidence_ids: list[str] = Field(default_factory=list)
     remaining_limitations: list[str] = Field(default_factory=list)
+    error_type: str | None = None
+    error: str | None = None
+    observation_id: str | None = None
 
 
 class FinalAnnotation(BaseModel):

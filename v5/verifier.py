@@ -172,6 +172,7 @@ async def verify(state: V5State, *, scope: str, client: Any, model: str, tempera
     state.questions.append(question)
     active, pending, last_active = "multiple", None, "multiple"
     latest = None
+    verifier_error: dict[str, Any] | None = None
     trigger = "max_rounds_reached"
 
     def payload() -> dict[str, Any]:
@@ -246,10 +247,29 @@ async def verify(state: V5State, *, scope: str, client: Any, model: str, tempera
                     raise ValueError("solved: requires the pending candidate, successful comparison with coverage, "
                                      "validation_passed=true, and current observation evidence IDs")
 
-        latest = await complete(
-            client, state, system=VERIFIER_SYSTEM, recipient="LLM_A", stage=f"{scope}_assessment",
-            model=model, temperature=temperature, retries=retries, response_type=VerifierResponse,
-            payload={**payload(), **build_llm_context(state, observation)}, semantic_validator=validate)
+        try:
+            latest = await complete(
+                client, state, system=VERIFIER_SYSTEM, recipient="LLM_A", stage=f"{scope}_assessment",
+                model=model, temperature=temperature, retries=retries, response_type=VerifierResponse,
+                payload={**payload(), **build_llm_context(state, observation)}, semantic_validator=validate)
+        except (ValueError, TypeError) as error:
+            # A verifier response is model input, not a program decision.  If
+            # the bounded repair attempts still produce an illegal response,
+            # preserve the error and finish through the explicit resolver
+            # rather than aborting the whole cluster before final judgment.
+            verifier_error = {
+                "error_type": type(error).__name__, "error": str(error),
+                "scope": scope, "round": cycle, "state": active,
+                "observation_id": observation.observation_id,
+                "evidence_ids": list(observation.evidence_ids),
+            }
+            state.verification_history.append({
+                "role": "program", "scope": scope, "round": cycle,
+                "event": "verifier_protocol_error", "state": active,
+                "error": verifier_error,
+            })
+            trigger = "verifier_protocol_error"
+            break
         next_state = latest.next_state
         if next_state == "validation":
             pending = latest.candidate_id
@@ -274,7 +294,7 @@ async def verify(state: V5State, *, scope: str, client: Any, model: str, tempera
 
     state.transition_history.append({"scope": scope, "round": state.rounds[scope],
                                      "from": active, "to": "unresolved", "action": "final_resolve",
-                                     "trigger": trigger})
+                                     "trigger": trigger, "verifier_error": verifier_error})
     def validate_resolution(value: ResolutionResponse) -> None:
         if value.selected_candidate_id not in final_allowed:
             raise ValueError(f"selected_candidate_id: choose from {sorted(final_allowed)}")
@@ -287,12 +307,16 @@ async def verify(state: V5State, *, scope: str, client: Any, model: str, tempera
         client, state, system=RESOLVER_SYSTEM, recipient="LLM_A", stage=f"{scope}_final_resolve",
         model=model, temperature=temperature, retries=retries, response_type=ResolutionResponse,
         payload={**payload(), "state": "unresolved", "trigger": trigger, "last_active_state": last_active,
-                 "last_assessment": latest.model_dump() if latest else None},
+                 "last_assessment": latest.model_dump() if latest else None,
+                 "verifier_error": verifier_error},
         semantic_validator=validate_resolution)
     audit = ResolutionAudit(last_active_state=last_active, trigger=trigger,
                             selected_candidate_id=resolution.selected_candidate_id,
                             reason=resolution.reason, evidence_ids=resolution.evidence_ids,
-                            remaining_limitations=resolution.remaining_limitations)
+                            remaining_limitations=resolution.remaining_limitations,
+                            error_type=verifier_error.get("error_type") if verifier_error else None,
+                            error=verifier_error.get("error") if verifier_error else None,
+                            observation_id=verifier_error.get("observation_id") if verifier_error else None)
     report = VerificationReport(
         report_id=f"VR_{scope.upper()}", target_id=target.target_id, scope=scope,
         verification_status="resolved", selected_candidate_id=resolution.selected_candidate_id,
